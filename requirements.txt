@@ -1,0 +1,23 @@
+# Portfolio Intelligence — Dependencies
+# Install: pip install -r requirements.txt
+
+flask
+flask-cors
+requests
+SQLAlchemy
+reportlab
+numpy
+pandas
+scipy
+statsmodels
+schedule
+yfinance
+riskfolio-lib
+quantstats
+pmdarima
+pandas-ta
+arch
+empyrical-reloaded
+ffn
+cvxpy
+scikit-learn

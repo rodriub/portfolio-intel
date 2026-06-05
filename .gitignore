@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.secret
+
+# Local runtime state
+*.db
+*.sqlite
+*.sqlite3
+portfolio_intel.db
+last_report.json
+eod_price_cache.json
+dashboard.log
+*.log
+
+# Generated reports / exports
+*.pdf
+weekly_portfolio_report.*
+reports/
+exports/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Spec Kit local/generated state
+.specify/feature.json
+.specify/init-options.json
+.specify/extensions.yml
+.specify/workflows/
+.specify/extensions/
+
+# Local agent/plugin generated additions
+.agents/skills/speckit-git-*/
+config.py
+venv/
