@@ -1044,7 +1044,7 @@ class SecClient:
         try:
             r = requests.get(
                 f"https://data.sec.gov/submissions/CIK{cik_str}.json",
-                headers={"User-Agent": "portfolio-intel/1.0 contact@example.com"},
+                headers={"User-Agent": "portfolio-intel/1.0 public-release"},
                 timeout=15,
             )
             r.raise_for_status()
@@ -1677,7 +1677,13 @@ class BehavioralAudit:
         fundamentals = modules.get("fundamentals", {}).get("stocks", {})
         risk = modules.get("risk_analytics", {})
         weights = risk.get("portfolio", {}).get("real_weights", {})
-        lite_weight = safe_float(weights.get("LITE"), 41.0)
+        concentration_ticker, concentration_weight = max(
+            weights.items(),
+            key=lambda item: safe_float(item[1], 0),
+            default=(None, 41.0),
+        )
+        concentration_weight = safe_float(concentration_weight, 41.0)
+        concentration_warning = config.SPECIAL_FLAGS.get(concentration_ticker, "") if concentration_ticker else ""
         ai_names = ["ai", "semi", "optical", "chip", "infra"]
         ai_count = sum(1 for p in config.PORTFOLIO if any(token in p.get("sector", "").lower() for token in ai_names))
         ai_ratio = ai_count / len(config.PORTFOLIO)
@@ -1687,10 +1693,10 @@ class BehavioralAudit:
         scores = {
             "herding": min(10, round(ai_ratio * 10)),
             "confirmation": min(10, round(ai_ratio * 8 + 1)),
-            "disposition": 8 if lite_weight and lite_weight >= 35 else 5,
+            "disposition": 8 if concentration_weight and concentration_weight >= 35 else 5,
             "overconfidence": 7 if avg_gain > 100 else 4,
             "recency": 7 if ai_ratio >= 0.75 else 4,
-            "anchoring": 7 if lite_weight and lite_weight >= 35 else 5,
+            "anchoring": 7 if concentration_weight and concentration_weight >= 35 else 5,
             "home_bias": 3,
             "loss_aversion": 5,
         }
@@ -1700,18 +1706,18 @@ class BehavioralAudit:
             "avg_score": round(avg, 1),
             "overall_grade": "A" if avg < 3 else "B" if avg < 4.5 else "C" if avg < 6 else "D" if avg < 7.5 else "F",
             "portfolio_concentration_hhi": round(hhi, 4),
-            "lite_special_flag": config.SPECIAL_FLAGS.get("LITE"),
-            "tax_context": config.TAX_CONTEXT,
+            "concentration_warning": concentration_warning,
+            "tax_context": "Tax treatment depends on investor residency and jurisdiction.",
             "devils_advocate": (
-                "The portfolio is heavily exposed to one AI-infrastructure regime. LITE's large gain and weight can make "
-                "holding feel rational even if the forward risk/reward has changed. A disciplined review should ask what "
-                "would happen if hyperscaler capex slows, optical component margins normalize, or one earnings miss forces "
+                "The portfolio may be heavily exposed to one theme or position. A largest concentrated position with high portfolio weight "
+                "and a large unrealized gain can make holding feel rational even if the forward risk/reward has changed. A disciplined review should ask what "
+                "would happen if the main growth driver slows, margins normalize, or one earnings miss forces "
                 "multiple compression before the thesis is invalidated."
             ),
             "recommendations": [
-                "Review LITE staged-exit rules separately from the original purchase thesis.",
+                "Review staged-exit rules for the largest concentrated position separately from the original purchase thesis.",
                 "Use position weights, not unrealized gains, as the first risk-control input.",
-                "For F-1 non-resident alien context, review dividend withholding and realized-gain reporting before tax-sensitive trades.",
+                "Tax treatment depends on investor residency and jurisdiction.",
             ],
         }
 
@@ -2393,7 +2399,7 @@ class IntelEngine:
                 add(article.get("title"), (article.get("source") or {}).get("name", "NewsData"), article.get("publishedAt"), ticker, article.get("url", ""), "NewsData")
 
         top_feed = []
-        priority = ["LITE"] + [t for t in config.TICKERS if t != "LITE"]
+        priority = list(config.TICKERS)
         for ticker in priority:
             top_feed.extend(by_ticker.get(ticker, [])[:3])
         counts = {ticker: len(items) for ticker, items in by_ticker.items()}
@@ -2409,7 +2415,7 @@ class IntelEngine:
             "top_feed_cap_per_ticker": 3,
             "sources": sorted({row.get("provider") for rows in by_ticker.values() for row in rows if row.get("provider")}),
             "dedupe": "normalized_headline",
-            "note": "Grouped by ticker first; LITE receives priority ordering but is capped at three top-feed articles.",
+            "note": "Grouped by ticker first; each ticker is capped at three top-feed articles.",
         }
 
     def _scan_fundamentals(self, *_):
@@ -2927,7 +2933,7 @@ class IntelEngine:
                 "normal_liquidation_days": safe_round(normal_days, 2),
                 "stressed_liquidation_days": safe_round(stressed_days, 2),
                 "bucket": bucket,
-                "note": config.SPECIAL_FLAGS.get(ticker) if ticker == "LITE" else "",
+                "note": config.SPECIAL_FLAGS.get(ticker, ""),
             })
         stressed_weight = buckets["stressed liquidity"] / snap["total_value"] if snap["total_value"] else 0
         ladder_weight = buckets["1-3 days"] / snap["total_value"] if snap["total_value"] else 0
@@ -2962,8 +2968,9 @@ class IntelEngine:
             flag = ""
             if risk_pct > weight_pct * 1.25 + 5:
                 flag = "Risk contribution materially exceeds weight"
-            if ticker == "LITE":
-                flag = (flag + " | " if flag else "") + config.SPECIAL_FLAGS.get("LITE", "")
+            special_flag = config.SPECIAL_FLAGS.get(ticker, "")
+            if special_flag:
+                flag = (flag + " | " if flag else "") + special_flag
             rows.append({
                 "ticker": ticker,
                 "portfolio_weight_pct": safe_round(weight_pct, 2),
@@ -2979,7 +2986,7 @@ class IntelEngine:
             "portfolio_annual_volatility_pct": safe_round(port_vol_daily * np.sqrt(252) * 100, 2),
             "portfolio_var_1w_pct": safe_round(total_var_1w * 100 if total_var_1w is not None else None, 2),
             "commentary": "Risk contribution shows which holdings consume portfolio risk budget. A high contribution is a governance issue, not an automatic trade instruction.",
-            "lite_warning": config.SPECIAL_FLAGS.get("LITE"),
+            "concentration_warning": next((config.SPECIAL_FLAGS.get(row.get("ticker"), "") for row in rows if config.SPECIAL_FLAGS.get(row.get("ticker"), "")), ""),
         })
 
     def _classify_price_regime(self, prices: pd.Series) -> dict:
@@ -3105,7 +3112,7 @@ class IntelEngine:
         for row in holdings:
             current = safe_float(row.get("weight_pct"), 0)
             target = min(target_single, 100 / max(len(holdings), 1))
-            if row.get("ticker") == "LITE":
+            if config.SPECIAL_FLAGS.get(row.get("ticker")):
                 target = target_single
             drift = current - target
             pressure = min(abs(drift) * 3.0, 100)
@@ -3406,7 +3413,7 @@ class IntelEngine:
                 "review thesis and opportunity cost" if label == "capital review needed" else
                 "hold within policy range"
             )
-            flag = config.SPECIAL_FLAGS.get(ticker) if ticker == "LITE" else ""
+            flag = config.SPECIAL_FLAGS.get(ticker, "")
             rows.append({
                 "ticker": ticker,
                 "capital_efficiency_score": safe_round(efficiency, 1),
@@ -3559,7 +3566,7 @@ class IntelEngine:
         return {
             "items": clean_json(rows),
             "disclaimer": "Not investment advice. Signals are a rules-based checklist from free market data and may be stale or incomplete.",
-            "lite_warning": config.SPECIAL_FLAGS.get("LITE"),
+            "concentration_warning": next((config.SPECIAL_FLAGS.get(row.get("ticker"), "") for row in rows if config.SPECIAL_FLAGS.get(row.get("ticker"), "")), ""),
         }
 
     def _period_return(self, prices: pd.Series, days: int):
@@ -3680,9 +3687,10 @@ class IntelEngine:
             score -= 12
             reasons.append("Position concentration is high")
 
-        if ticker == "LITE":
+        special_flag = config.SPECIAL_FLAGS.get(ticker, "")
+        if special_flag:
             score -= 15
-            reasons.append("LITE special warning: approximately 40% weight and +550% gain; trim discipline overrides fresh enthusiasm")
+            reasons.append(f"Special concentration warning for largest concentrated position: {special_flag}")
 
         score = int(max(min(round(score), 100), -100))
         confidence_points = sum(x is not None for x in [one_m, three_m, six_m, rsi, macd, macd_signal, price, sma20, sma50, pe, pb]) + (1 if rec else 0)
@@ -3742,7 +3750,7 @@ class IntelEngine:
                 "Potential Turnarounds" if quality >= 50 and momentum < 50 else
                 "Weak / Deteriorating"
             )
-            warning = config.SPECIAL_FLAGS.get("LITE") if ticker == "LITE" else ""
+            warning = config.SPECIAL_FLAGS.get(ticker, "")
             rows.append({
                 "ticker": ticker,
                 "fundamental_quality_score": quality,
@@ -3775,7 +3783,7 @@ class IntelEngine:
             "x_axis": "Fundamental Quality Score",
             "y_axis": "Momentum & Technical Strength Score",
             "bubble_size": "portfolio_weight_pct",
-            "lite_warning": config.SPECIAL_FLAGS.get("LITE"),
+            "concentration_warning": next((row.get("warning", "") for row in rows if row.get("warning")), ""),
             "disclaimer": "Not investment advice. Conviction scores are heuristic and depend on available free data.",
         }
 
@@ -3945,7 +3953,7 @@ class IntelEngine:
             "theme_weights": {k: safe_round(v * 100, 2) for k, v in theme_weights.items()},
             "cash_weight_pct": safe_round(snap["cash_weight"] * 100, 2),
             "breaches": breaches,
-            "lite_warning": config.SPECIAL_FLAGS.get("LITE") if any(b["name"] == "LITE" for b in breaches) else "",
+            "concentration_warning": next((config.SPECIAL_FLAGS.get(b.get("name"), "") for b in breaches if config.SPECIAL_FLAGS.get(b.get("name"), "")), ""),
         })
 
     def _shock_result(self, name: str, affected: list[str], shock_pct: float, snap: dict):

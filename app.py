@@ -86,7 +86,7 @@ class Portfolio(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(120), nullable=False, unique=True)
     account_type = Column(String(80), nullable=False, default="Taxable Brokerage")
-    owner = Column(String(120), nullable=False, default="Rodrigo")
+    owner = Column(String(120), nullable=False, default="Portfolio Owner")
     base_currency = Column(String(8), nullable=False, default="USD")
     risk_profile = Column(String(160), nullable=False, default="")
     time_horizon = Column(String(80), nullable=False, default="")
@@ -343,7 +343,7 @@ def seed_default_portfolio():
         portfolio = Portfolio(
             name="Default Portfolio",
             account_type="Taxable Brokerage",
-            owner="Rodrigo",
+            owner="Portfolio Owner",
             base_currency="USD",
             risk_profile=config.PORTFOLIO_POLICY.get("risk_profile", ""),
             time_horizon=config.PORTFOLIO_POLICY.get("time_horizon", ""),
@@ -1263,7 +1263,7 @@ def report_layers(bundle):
                 {"title": "Behavioral Check", "bullets": [
                     f"Overall grade: {bundle['behavioral'].get('overall_grade', '--')}",
                     f"Average bias score: {bundle['behavioral'].get('avg_score', '--')}",
-                    f"LITE special flag: {bundle['behavioral'].get('lite_special_flag', '--')}",
+                    f"Concentration flag: {bundle['behavioral'].get('concentration_warning', '--')}",
                     f"Devil's advocate: {bundle['behavioral'].get('devils_advocate', '--')}",
                 ]},
                 {"title": "open review items", "table": (open_reviews, [("review_type", "Review Type"), ("category", "Category"), ("severity", "Severity"), ("reason", "Reason")])},
@@ -2135,12 +2135,12 @@ function renderHoldings() {
     const weight = s.portfolio_weight_pct ?? (s.market_value && total ? s.market_value / total * 100 : null);
     const source = s.price_source || 'pending';
     const session = s.market_session || '';
-    const liteWarn = p.ticker === 'LITE' ? '<div class="warn-badge">Concentration Review</div>' : '';
-    return `<div class="holding ${p.ticker === 'LITE' ? 'selected' : ''}">
+    const concentrationWarn = portfolioMeta.special_flags?.[p.ticker] ? '<div class="warn-badge">Concentration Review</div>' : '';
+    return `<div class="holding ${portfolioMeta.special_flags?.[p.ticker] ? 'selected' : ''}">
       <div class="ticker"><strong>${esc(p.ticker)}</strong><span>${weight != null ? fmt.format(weight) + '%' : 'pending'}</span></div>
       <div class="pnl ${clsNum(pnl)}">${pnl != null ? fmt.format(pnl) + '%' : '--'}</div>
       <div class="small">${price != null ? money.format(price) : 'price pending'} · ${esc(source)} ${session ? '· ' + esc(session) : ''}</div>
-      ${liteWarn}
+      ${concentrationWarn}
     </div>`;
   }).join('');
 }
@@ -2370,11 +2370,11 @@ function renderFundamentals(data) {
   const rows = Object.entries(data.stocks || {}).map(([ticker, s]) => ({ticker, ...s}));
   return `<div class="metrics">
     ${metric('Buying Power', data.buying_power)}
-    ${metric('LITE Flag', rows.find(r=>r.ticker==='LITE')?.portfolio_weight_pct, '%')}
-    ${metric('Tax Context', 'F-1 NRA')}
+    ${metric('Largest Weight', rows.length ? Math.max(...rows.map(r=>Number(r.portfolio_weight_pct)||0)) : null, '%')}
+    ${metric('Tax Context', 'Jurisdiction-specific')}
     ${metric('Holdings', rows.length)}
   </div>` + table(rows, [
-    {key:'ticker', label:'Ticker', render:r => `<span class="${r.ticker==='LITE'?'pos':'neu'}">${esc(r.ticker)}</span>`},
+    {key:'ticker', label:'Ticker', render:r => `<span class="${r.special_flag?'pos':'neu'}">${esc(r.ticker)}</span>`},
     {key:'price', label:'Price', render:r => money.format(r.price || 0)},
     {key:'price_source', label:'Source'},
     {key:'market_session', label:'Session'},
@@ -2541,7 +2541,7 @@ function renderPolicyAllocation(data) {
     ${metric('Policy Breaches', (data.breaches || []).length)}
     ${metric('Benchmark', data.policy?.target_benchmark || '--')}
   </div>
-  ${data.lite_warning ? `<div class="warning">${esc(data.lite_warning)}</div>` : ''}
+  ${data.concentration_warning ? `<div class="warning">${esc(data.concentration_warning)}</div>` : ''}
   <h3 class="panel-title">Policy Breaches</h3>
   ${table(data.breaches || [], [
     {key:'type', label:'Type'}, {key:'name', label:'Name'}, {key:'actual', label:'Actual %'},
@@ -2925,9 +2925,9 @@ function renderRiskContribution(data) {
     ${metric('Portfolio Vol', data.portfolio_annual_volatility_pct, '%')}
     ${metric('1W VaR', data.portfolio_var_1w_pct, '%')}
     ${metric('Positions', rows.length)}
-    ${metric('LITE Flag', rows.find(r=>r.ticker==='LITE')?.volatility_contribution_pct, '%')}
+    ${metric('Largest Risk', rows.length ? Math.max(...rows.map(r=>Number(r.volatility_contribution_pct)||0)) : null, '%')}
   </div>
-  ${data.lite_warning ? `<div class="warning">${esc(data.lite_warning)}</div>` : ''}
+  ${data.concentration_warning ? `<div class="warning">${esc(data.concentration_warning)}</div>` : ''}
   ${contributionBars(rows, 'volatility_contribution_pct')}
   ${table(rows, [
     {key:'ticker', label:'Ticker'}, {key:'portfolio_weight_pct', label:'Weight %'}, {key:'volatility_contribution_pct', label:'Risk Contrib %'},
@@ -2980,7 +2980,7 @@ function renderSignalActionPlan(data) {
   </div>
   ${renderSignalChart(rows)}
   <div class="news-item"><div class="news-meta">Disclaimer</div><div class="news-title">${esc(data.disclaimer || 'Not investment advice.')}</div></div>
-  <div class="news-item"><div class="news-meta">LITE Warning</div><div class="news-title pos">${esc(data.lite_warning || '')}</div></div>
+  ${data.concentration_warning ? `<div class="news-item"><div class="news-meta">Concentration Warning</div><div class="news-title pos">${esc(data.concentration_warning)}</div></div>` : ''}
   ${table(rows, [
     {key:'ticker', label:'Ticker'}, {key:'signal_score', label:'Score'}, {key:'action', label:'Action'},
     {key:'confidence', label:'Confidence'}, {key:'return_1m', label:'1M %'}, {key:'return_3m', label:'3M %'},
@@ -3006,14 +3006,14 @@ function renderSignalChart(rows) {
 
 function renderConvictionMatrix(data) {
   const rows = data.items || [];
-  const lite = rows.find(r => r.ticker === 'LITE' && r.warning);
+  const concentration = rows.find(r => r.warning);
   return `<div class="metrics">
     ${metric('Holdings', rows.length)}
     ${metric('Avg Quality', rows.length ? rows.reduce((s,r)=>s + (Number(r.fundamental_quality_score)||0), 0) / rows.length : null)}
     ${metric('Avg Momentum', rows.length ? rows.reduce((s,r)=>s + (Number(r.momentum_technical_score)||0), 0) / rows.length : null)}
     ${metric('Bubble Size', 'Weight %')}
   </div>
-  ${lite ? `<div class="warning">${esc(lite.warning)}</div>` : ''}
+  ${concentration ? `<div class="warning">${esc(concentration.warning)}</div>` : ''}
   <div id="convictionPlot" class="plot-wrap"></div>
   <h3 class="panel-title" style="margin-top:16px">Matrix Detail</h3>
   ${table(rows, [
@@ -3315,7 +3315,7 @@ function renderWealthView(data) {
   </div>
 
   <h3 class="panel-title" style="margin-top:16px">Risk Requiring Attention</h3>
-  ${policy.lite_warning ? `<div class="warning">${esc(policy.lite_warning)}</div>` : ''}
+  ${policy.concentration_warning ? `<div class="warning">${esc(policy.concentration_warning)}</div>` : ''}
   <div class="metrics">
     ${metric('Top Holding', liquidity.top1_weight_pct, '%')}
     ${metric('Top 3 Holdings', liquidity.top3_weight_pct, '%')}
@@ -3553,10 +3553,10 @@ function renderBehavioral(data) {
     ${metric('Grade', data.overall_grade)}
     ${metric('Avg Bias', data.avg_score)}
     ${metric('HHI', data.portfolio_concentration_hhi)}
-    ${metric('Tax Context', 'F-1 NRA')}
+    ${metric('Tax Context', 'Jurisdiction-specific')}
   </div>
   <div class="news-item"><div class="news-meta">Devil's advocate</div><div class="news-title">${esc(data.devils_advocate || '')}</div></div>
-  <div class="news-item"><div class="news-meta">LITE special flag</div><div class="news-title pos">${esc(data.lite_special_flag || '')}</div></div>
+  ${data.concentration_warning ? `<div class="news-item"><div class="news-meta">Concentration flag</div><div class="news-title pos">${esc(data.concentration_warning)}</div></div>` : ''}
   ${table(scores, [{key:'bias', label:'Bias'}, {key:'score', label:'Score'}])}
   <h3 class="panel-title" style="margin-top:16px">Recommendations</h3>
   <div class="news-list">${(data.recommendations || []).map(x => `<div class="news-item"><div class="news-title">${esc(x)}</div></div>`).join('')}</div>`;
