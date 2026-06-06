@@ -87,3 +87,25 @@ The dashboard supports:
 This platform is for decision support only. It does not provide financial, legal, or tax advice. Outputs are non-binding and should be reviewed with appropriate professional judgment.
 
 Not investment advice.
+
+# Portfolio Intelligence Platform
+
+A multi-provider wealth management and portfolio intelligence platform integrating macroeconomic monitoring, factor exposure analysis, stress testing, portfolio governance, and risk management.
+
+---
+
+## Executive Wealth View
+
+![Wealth View](screenshots/Screenshot%202026-06-05%20at%208.16.52%E2%80%AFPM.png)
+
+## Macro Pulse
+
+![Macro Pulse](screenshots/Screenshot%202026-06-05%20at%208.17.06%E2%80%AFPM.png)
+
+## Audit & Reliability
+
+![Audit & Reliability](screenshots/Screenshot%202026-06-05%20at%208.17.40%E2%80%AFPM.png)
+
+## Position Sizing Engine
+
+![Position Sizing](screenshots/Screenshot%202026-06-05%20at%208.18.43%E2%80%AFPM.png)
