@@ -12,14 +12,75 @@ Do not commit your real config.py if it contains personal portfolio data.
 
 import os
 
-# API keys. Leave blank/placeholder for disabled optional providers.
-FRED_KEY = os.getenv("FRED_KEY", "YOUR_FRED_KEY")
-POLYGON_KEY = os.getenv("POLYGON_KEY", "YOUR_POLYGON_KEY")
-TIINGO_KEY = os.getenv("TIINGO_KEY", "YOUR_TIINGO_KEY")
-FINNHUB_KEY = os.getenv("FINNHUB", "YOUR_FINNHUB_KEY")
-SEC_API_KEY = os.getenv("SEC_API", "YOUR_SEC_API_KEY")
-FMP_KEY = os.getenv("FMP_KEY", "YOUR_FMP_KEY")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "YOUR_NEWSAPI_KEY")
+def _load_local_env(path=".env"):
+    """Load local key=value pairs without overriding real environment vars."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        return True
+    except Exception:
+        return False
+
+LOCAL_ENV_LOADED = _load_local_env()
+
+def _first_nonempty_env(*names, default):
+    """Return the first non-empty environment value and its variable name."""
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip(), name
+    return default, None
+
+
+# Accepted environment variable names, in priority order:
+# Polygon: POLYGON_KEY, POLYGON_API_KEY
+# Tiingo: TIINGO_KEY, TIINGO_API_KEY
+# Finnhub: FINNHUB, FINNHUB_KEY
+# NewsData.io: NEWSDATA_KEY
+# SEC API: SEC_API, SEC_API_KEY
+# FRED, FMP, and Alpha Vantage use FRED_KEY, FMP_KEY, and
+# ALPHAVANTAGE_KEY respectively.
+FRED_KEY, FRED_KEY_SOURCE = _first_nonempty_env("FRED_KEY", default="YOUR_FRED_KEY")
+POLYGON_KEY, POLYGON_KEY_SOURCE = _first_nonempty_env("POLYGON_KEY", "POLYGON_API_KEY", default="YOUR_POLYGON_KEY")
+TIINGO_KEY, TIINGO_KEY_SOURCE = _first_nonempty_env("TIINGO_KEY", "TIINGO_API_KEY", default="YOUR_TIINGO_KEY")
+FINNHUB_KEY, FINNHUB_KEY_SOURCE = _first_nonempty_env("FINNHUB", "FINNHUB_KEY", default="YOUR_FINNHUB_KEY")
+SEC_API_KEY, SEC_API_KEY_SOURCE = _first_nonempty_env("SEC_API", "SEC_API_KEY", default="YOUR_SEC_API_KEY")
+FMP_KEY, FMP_KEY_SOURCE = _first_nonempty_env("FMP_KEY", default="YOUR_FMP_KEY")
+ALPHAVANTAGE_KEY, ALPHAVANTAGE_KEY_SOURCE = _first_nonempty_env("ALPHAVANTAGE_KEY", default="YOUR_ALPHAVANTAGE_KEY")
+NEWSAPI_KEY, NEWSAPI_KEY_SOURCE = _first_nonempty_env("NEWSAPI_KEY", default="YOUR_NEWSAPI_KEY")
+NEWSDATA_KEY, NEWSDATA_KEY_SOURCE = _first_nonempty_env("NEWSDATA_KEY", default="YOUR_NEWSDATA_KEY")
+
+
+def provider_configuration_report():
+    """Return provider configuration state without exposing credential values."""
+    providers = [
+        ("Polygon", POLYGON_KEY, POLYGON_KEY_SOURCE),
+        ("FRED", FRED_KEY, FRED_KEY_SOURCE),
+        ("Tiingo", TIINGO_KEY, TIINGO_KEY_SOURCE),
+        ("Finnhub", FINNHUB_KEY, FINNHUB_KEY_SOURCE),
+        ("SEC API", SEC_API_KEY, SEC_API_KEY_SOURCE),
+        ("FMP", FMP_KEY, FMP_KEY_SOURCE),
+        ("Alpha Vantage", ALPHAVANTAGE_KEY, ALPHAVANTAGE_KEY_SOURCE),
+        ("NewsData", NEWSDATA_KEY, NEWSDATA_KEY_SOURCE),
+    ]
+    return [
+        {
+            "provider": provider,
+            "variable_detected": source,
+            "configured": bool(value and not str(value).startswith("YOUR_")),
+        }
+        for provider, value, source in providers
+    ]
 
 # Sample portfolio. These are not recommendations.
 PORTFOLIO = [
@@ -128,6 +189,33 @@ PORTFOLIO_POLICY = {
     "target_benchmark": "SPY",
     "time_horizon": "5-10 years",
     "risk_profile": "Growth-oriented with diversification and drawdown guardrails",
+}
+
+FRAMEWORK_RULES = {
+    "max_risk_contribution": 0.35,
+    "max_factor_concentration": 0.45,
+    "cash_buffer_min": 0.05,
+    "bernstein_relative_band": 0.25,
+    "bernstein_absolute_band": 0.05,
+    "daryanani_band": 0.20,
+    "concentration_exception_weight": 0.35,
+    "concentration_exception_gain_pct": 100,
+    "staged_exit": {
+        "stage_1_weight": 0.25,
+        "stage_2_weight": 0.35,
+        "stage_3_risk_contribution": 0.40,
+        "stage_4_weight": 0.45,
+        "stage_4_gain_pct": 300,
+        "drawdown_from_high": 0.20,
+        "valuation_stretch_pct": 50,
+        "factor_crowding_pct": 45,
+    },
+    "position_sizing": {
+        "conservative_pct": 0.02,
+        "balanced_pct": 0.04,
+        "aggressive_pct": 0.06,
+        "high_volatility_cap_pct": 0.03,
+    },
 }
 
 FACTOR_PROXIES = {

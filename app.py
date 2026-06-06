@@ -15,6 +15,7 @@ Endpoints:
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,6 +32,14 @@ from engine import IntelEngine, market_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("server")
+
+for provider_config in config.provider_configuration_report():
+    log.info(
+        "Provider configuration: provider=%s variable=%s configured=%s",
+        provider_config["provider"],
+        provider_config["variable_detected"] or "none",
+        provider_config["configured"],
+    )
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
@@ -77,7 +86,7 @@ class Portfolio(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(120), nullable=False, unique=True)
     account_type = Column(String(80), nullable=False, default="Taxable Brokerage")
-    owner = Column(String(120), nullable=False, default="Portfolio Owner")
+    owner = Column(String(120), nullable=False, default="Rodrigo")
     base_currency = Column(String(8), nullable=False, default="USD")
     risk_profile = Column(String(160), nullable=False, default="")
     time_horizon = Column(String(80), nullable=False, default="")
@@ -161,6 +170,9 @@ CANONICAL_MODULES = [
     "drawdown_survival",
     "goals_based",
     "liquidity_concentration",
+    "framework_compliance",
+    "position_sizing",
+    "staged_exit_framework",
     "portfolio_narrative",
     "rebalancing_intelligence",
     "wealth_view",
@@ -201,6 +213,12 @@ LEGACY_MODULES = {
     "drawdown": "drawdown_survival",
     "goals": "goals_based",
     "liquidity": "liquidity_concentration",
+    "framework": "framework_compliance",
+    "compliance": "framework_compliance",
+    "sizing": "position_sizing",
+    "position_sizing": "position_sizing",
+    "staged_exit": "staged_exit_framework",
+    "trim_framework": "staged_exit_framework",
     "narrative": "portfolio_narrative",
     "rebalancing": "rebalancing_intelligence",
     "wealth": "wealth_view",
@@ -212,8 +230,36 @@ LEGACY_MODULES = {
 }
 
 
+def normalize_legacy_news_labels(report):
+    """Normalize obsolete provider labels in cached report metadata."""
+    if not isinstance(report, dict):
+        return report
+    report["source_priority"] = list(dict.fromkeys(
+        "NewsData" if source == "NewsAPI" else source
+        for source in report.get("source_priority", [])
+        if source
+    ))
+    news = (report.get("modules") or {}).get("portfolio_news")
+    if not isinstance(news, dict):
+        return report
+    news["sources"] = sorted({
+        "NewsData" if source == "NewsAPI" else source
+        for source in news.get("sources", [])
+        if source
+    })
+    for item in news.get("items", []):
+        if isinstance(item, dict) and item.get("provider") == "NewsAPI":
+            item["provider"] = "NewsData"
+    for items in (news.get("by_ticker") or {}).values():
+        for item in items or []:
+            if isinstance(item, dict) and item.get("provider") == "NewsAPI":
+                item["provider"] = "NewsData"
+    return report
+
+
 def save_report(report):
     global last_report, scan_completed_at, loaded_from_cache, cache_timestamp
+    report = normalize_legacy_news_labels(sanitize_report_public_payload(report))
     last_report = report
     scan_completed_at = datetime.now(timezone.utc).isoformat()
     loaded_from_cache = False
@@ -238,7 +284,7 @@ def load_cached_report():
     try:
         with open(REPORT_FILE, "r") as f:
             data = json.load(f)
-        last_report = data.get("report")
+        last_report = normalize_legacy_news_labels(data.get("report"))
         cache_timestamp = data.get("cache_timestamp") or data.get("scan_completed_at") or data.get("timestamp")
         scan_completed_at = data.get("scan_completed_at") or data.get("timestamp")
         loaded_from_cache = True
@@ -297,7 +343,7 @@ def seed_default_portfolio():
         portfolio = Portfolio(
             name="Default Portfolio",
             account_type="Taxable Brokerage",
-            owner="Portfolio Owner",
+            owner="Rodrigo",
             base_currency="USD",
             risk_profile=config.PORTFOLIO_POLICY.get("risk_profile", ""),
             time_horizon=config.PORTFOLIO_POLICY.get("time_horizon", ""),
@@ -536,22 +582,127 @@ def file_age_hours(path):
     return round((time.time() - os.path.getmtime(path)) / 3600, 2)
 
 
+def sanitize_public_failure_reason(reason):
+    text = str(reason or "")
+    for secret in [
+        getattr(config, "FRED_KEY", None),
+        getattr(config, "POLYGON_KEY", None),
+        getattr(config, "TIINGO_KEY", None),
+        getattr(config, "FINNHUB_KEY", None),
+        getattr(config, "SEC_API_KEY", None),
+        getattr(config, "FMP_KEY", None),
+        getattr(config, "ALPHAVANTAGE_KEY", None),
+        getattr(config, "NEWSAPI_KEY", None),
+        getattr(config, "NEWSDATA_KEY", None),
+    ]:
+        if secret and not str(secret).startswith("YOUR_"):
+            text = text.replace(str(secret), "[redacted]")
+    text = re.sub(r"(https?://[^\s?'\"]+)\?[^\s'\"]+", r"\1?[redacted]", text)
+    text = re.sub(r"([?&](?:api_?key|token|access_token|secret|authorization|password)=)[^&\s'\"]+", r"\1[redacted]", text, flags=re.IGNORECASE)
+    return text
+
+
+def sanitize_failure_rows(rows):
+    clean = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        if "reason" in item:
+            item["reason"] = sanitize_public_failure_reason(item.get("reason"))
+        if "failure_reason" in item:
+            item["failure_reason"] = sanitize_public_failure_reason(item.get("failure_reason"))
+        clean.append(item)
+    return clean
+
+
+def sanitize_report_public_payload(value):
+    if isinstance(value, dict):
+        clean = {}
+        for key, item in value.items():
+            if key in {"reason", "failure_reason", "error", "notes"} and isinstance(item, str):
+                clean[key] = sanitize_public_failure_reason(item)
+            else:
+                clean[key] = sanitize_report_public_payload(item)
+        return clean
+    if isinstance(value, list):
+        return [sanitize_report_public_payload(item) for item in value]
+    return value
+
+
 def audit_reliability_snapshot():
     report = last_report or {}
     modules = report.get("modules", {}) if isinstance(report, dict) else {}
     fundamentals = modules.get("fundamentals", {}).get("stocks", {})
     price_audit = modules.get("price_audit", {}).get("items", [])
+    macro_pulse = modules.get("macro_pulse", {}) if isinstance(modules.get("macro_pulse", {}), dict) else {}
+    fred_failures = sanitize_failure_rows(macro_pulse.get("fred_failures", []) or macro_pulse.get("fred_failed_series", []))
+    fred_successes = macro_pulse.get("fred_succeeded_series", [])
+    fred_requested = [{"indicator": name, "series": series} for name, series in config.FRED_SERIES.items()]
+    fred_failure_note = "; ".join(f"{row.get('series')}: {row.get('reason')}" for row in fred_failures[:6])
     now = utc_now_iso()
-    configured = {
-        "Polygon": bool(config.POLYGON_KEY and not config.POLYGON_KEY.startswith("YOUR_")),
-        "FRED": bool(config.FRED_KEY and not config.FRED_KEY.startswith("YOUR_")),
-        "Tiingo": bool(config.TIINGO_KEY and not config.TIINGO_KEY.startswith("YOUR_")),
-        "Finnhub": bool(config.FINNHUB_KEY and not config.FINNHUB_KEY.startswith("YOUR_")),
-        "SEC API": bool(config.SEC_API_KEY and not config.SEC_API_KEY.startswith("YOUR_")),
-        "FMP": bool(config.FMP_KEY and not config.FMP_KEY.startswith("YOUR_")),
-        "NewsAPI": bool(config.NEWSAPI_KEY and not config.NEWSAPI_KEY.startswith("YOUR_")),
-        "yfinance": True,
+    provider_configuration = {
+        row["provider"]: row for row in config.provider_configuration_report()
     }
+    configured = {
+        provider: bool(row.get("configured"))
+        for provider, row in provider_configuration.items()
+    }
+    configured["yfinance"] = True
+
+    def provider_source(provider):
+        return (provider_configuration.get(provider) or {}).get("variable_detected") or "none"
+
+    def provider_usage(client):
+        usage = getattr(client, "usage", {}) if client is not None else {}
+        return {
+            "scan_started": bool(usage.get("scan_started")),
+            "requests_this_scan": int(usage.get("requests_this_scan", 0) or 0),
+            "successful_calls": int(usage.get("successful_calls", 0) or 0),
+            "failed_calls": int(usage.get("failed_calls", 0) or 0),
+            "fallback_activations": int(usage.get("fallback_activations", 0) or 0),
+            "fallback_opportunities": int(usage.get("fallback_opportunities", 0) or 0),
+        }
+
+    def usage_status(client, is_configured=True, failure_status=None):
+        usage = provider_usage(client)
+        if not is_configured:
+            return "not_configured"
+        if failure_status in {"rate_limited", "unauthorized"}:
+            return failure_status
+        if usage["successful_calls"] > 0:
+            return "available"
+        if usage["failed_calls"] > 0 or failure_status == "degraded":
+            return "degraded"
+        if usage["fallback_opportunities"] > 0:
+            return "dormant_fallback"
+        return "not_checked"
+
+    macro_has_payload = bool(modules.get("macro_pulse"))
+    macro_has_error = bool(macro_pulse.get("error"))
+    macro_has_diagnostics = all(key in macro_pulse for key in ("fred_key_loaded", "fred_succeeded_series", "fred_failed_series"))
+    fred_key_loaded = configured["FRED"]
+    if not configured["FRED"]:
+        fred_status = "not_configured"
+        fred_failure_reason = "FRED_KEY missing or placeholder"
+    elif macro_has_error:
+        fred_status = "degraded"
+        fred_failure_reason = sanitize_public_failure_reason(macro_pulse.get("error") or "Macro Pulse failed.")
+    elif not macro_has_payload:
+        fred_status = "not_checked"
+        fred_failure_reason = "Macro Pulse has not run in the latest report."
+    elif not macro_has_diagnostics:
+        fred_status = "unavailable"
+        fred_failure_reason = "Macro Pulse payload lacks FRED diagnostics; rerun scan to verify provider status."
+    elif fred_failures:
+        fred_status = "degraded"
+        fred_failure_reason = fred_failure_note or "One or more FRED series failed."
+    elif len(fred_successes) >= len(fred_requested):
+        fred_status = "available"
+        fred_failure_reason = ""
+    else:
+        fred_status = "unavailable"
+        fred_failure_reason = "Macro Pulse did not report successful FRED diagnostics."
     source_counts = {}
     stale_warnings = []
     for ticker, row in fundamentals.items():
@@ -576,15 +727,160 @@ def audit_reliability_snapshot():
     in_memory_429 = sorted(getattr(engine.polygon, "rate_limited_tickers", set()) or [])
     polygon_last_success = getattr(engine.polygon, "last_successful_at", {}) or {}
     last_polygon_timestamp = max(polygon_last_success.values()) if polygon_last_success else None
-    provider_rows = [
-        {"provider": "Polygon", "configured": configured["Polygon"], "status": "rate_limited" if polygon_429 or in_memory_429 else "available" if configured["Polygon"] else "not_configured", "last_successful_call": last_polygon_timestamp, "notes": f"{len(set(polygon_429 + in_memory_429))} ticker(s) rate limited"},
-        {"provider": "Tiingo", "configured": configured["Tiingo"], "status": "available" if configured["Tiingo"] else "not_configured", "last_successful_call": scan_completed_at if modules.get("portfolio_news") or any(r.get("source_used") == "Tiingo" for r in price_audit) else None, "notes": "Fallback pricing/news provider"},
-        {"provider": "Yahoo/yfinance", "configured": True, "status": "fallback_available", "last_successful_call": scan_completed_at if fundamentals else None, "notes": "Fundamentals and final delayed fallback"},
-        {"provider": "FRED", "configured": configured["FRED"], "status": "available" if configured["FRED"] and modules.get("macro_pulse") else "not_configured" if not configured["FRED"] else "not_checked", "last_successful_call": scan_completed_at if modules.get("macro_pulse") else None, "notes": "Macro series"},
-        {"provider": "Finnhub", "configured": configured["Finnhub"], "status": "available" if configured["Finnhub"] else "not_configured", "last_successful_call": scan_completed_at if modules.get("portfolio_news") else None, "notes": "Free company news/recommendations where available"},
-        {"provider": "NewsAPI", "configured": configured["NewsAPI"], "status": "available" if configured["NewsAPI"] else "not_configured", "last_successful_call": scan_completed_at if modules.get("portfolio_news") else None, "notes": "General news context"},
-        {"provider": "SEC API", "configured": configured["SEC API"], "status": "available" if configured["SEC API"] else "not_configured", "last_successful_call": scan_completed_at if modules.get("congress_insiders") else None, "notes": "Filings; EDGAR fallback exists"},
+    portfolio_news_items = modules.get("portfolio_news", {}).get("items", [])
+    market_news_items = [
+        item
+        for group in modules.get("market_context", {}).get("news_groups", [])
+        for item in group.get("items", [])
     ]
+    news_items = portfolio_news_items + market_news_items
+
+    def news_provider_status(provider, client):
+        if not configured.get(provider):
+            return "not_configured", None, f"{provider} key not configured."
+        usage = provider_usage(client)
+        last_success = getattr(client, "last_successful_at", None)
+        observed = any(row.get("provider") == provider for row in news_items)
+        failure = sanitize_public_failure_reason(getattr(client, "last_failure", ""))
+        if getattr(client, "status", None) == "rate_limited":
+            return "rate_limited", last_success, failure or f"{provider} rate limit reached."
+        if usage["successful_calls"] > 0 or observed:
+            return "available", last_success or scan_completed_at, "Endpoint supported and successful provider data observed."
+        if usage["failed_calls"] > 0 or failure:
+            return "degraded", None, failure
+        if usage["fallback_opportunities"] > 0:
+            return "dormant_fallback", last_success, "Configured fallback was not needed during this scan."
+        return "not_checked", None, "Configured, but no module attempted this provider in the current process."
+
+    newsdata_status, newsdata_last_success, newsdata_notes = news_provider_status("NewsData", engine.newsdata)
+    tiingo_price_observed = any(r.get("source_used") == "Tiingo" for r in price_audit)
+    tiingo_pricing_status = getattr(engine.tiingo, "pricing_status", "not_checked")
+    tiingo_news_status = getattr(engine.tiingo, "news_status", "not_checked")
+    tiingo_usage = provider_usage(engine.tiingo)
+    if not configured["Tiingo"]:
+        tiingo_status = "not_configured"
+    elif tiingo_pricing_status == "rate_limited" or tiingo_news_status == "rate_limited":
+        tiingo_status = "rate_limited"
+    elif tiingo_price_observed or tiingo_usage["successful_calls"] > 0:
+        tiingo_status = "available"
+    elif tiingo_usage["failed_calls"] > 0 or tiingo_pricing_status == "degraded" or tiingo_news_status in {"degraded", "forbidden"}:
+        tiingo_status = "degraded"
+    elif tiingo_usage["fallback_opportunities"] > 0:
+        tiingo_status = "dormant_fallback"
+    else:
+        tiingo_status = "not_checked"
+    tiingo_notes = f"pricing={tiingo_pricing_status}; news={tiingo_news_status}"
+    if tiingo_news_status == "forbidden":
+        tiingo_notes += "; Tiingo news forbidden, pricing remains independently available."
+
+    fmp_runtime_status = getattr(engine.fmp, "status", "not_checked")
+    if not configured["FMP"]:
+        fmp_status = "not_configured"
+        fmp_notes = "FMP key not configured."
+    elif fmp_runtime_status == "unauthorized":
+        fmp_status = "unauthorized"
+        fmp_notes = "FMP configured but unauthorized. Check key or plan."
+    elif fmp_runtime_status == "rate_limited":
+        fmp_status = "rate_limited"
+        fmp_notes = "FMP rate limit reached; requests are disabled for the remainder of this scan."
+    elif fmp_runtime_status == "available":
+        fmp_status = "available"
+        fmp_notes = "Fundamentals backup provider available."
+    elif fmp_runtime_status == "degraded":
+        fmp_status = "degraded"
+        fmp_notes = sanitize_public_failure_reason(getattr(engine.fmp, "last_failure", "")) or "FMP request failed."
+    else:
+        fmp_status = usage_status(engine.fmp, configured["FMP"])
+        fmp_notes = "Configured backup was not needed during this scan." if fmp_status == "dormant_fallback" else "Configured, but no module attempted FMP in the current process."
+
+    alpha_runtime_status = getattr(engine.alphavantage, "status", "not_checked")
+    if not configured["Alpha Vantage"]:
+        alpha_status = "not_configured"
+        alpha_notes = "Alpha Vantage key not configured."
+    elif alpha_runtime_status == "rate_limited":
+        alpha_status = "rate_limited"
+        alpha_notes = "Alpha Vantage rate limit reached; requests are disabled for the remainder of this scan."
+    elif alpha_runtime_status == "degraded":
+        alpha_status = "degraded"
+        alpha_notes = sanitize_public_failure_reason(getattr(engine.alphavantage, "last_failure", "")) or "Alpha Vantage fallback request failed."
+    elif alpha_runtime_status == "available":
+        alpha_status = "available"
+        alpha_notes = "Fundamentals or market-data fallback completed successfully."
+    else:
+        alpha_status = usage_status(engine.alphavantage, configured["Alpha Vantage"])
+        alpha_notes = "Configured as a dormant fallback; no Alpha Vantage request was needed in this scan." if alpha_status == "dormant_fallback" else "Configured, but no module attempted Alpha Vantage in the current process."
+
+    polygon_usage = provider_usage(engine.polygon)
+    polygon_source_observed = any(row.get("source_used") == "Polygon Official" for row in price_audit)
+    polygon_status = (
+        "not_configured" if not configured["Polygon"]
+        else "rate_limited" if polygon_429 or in_memory_429
+        else "available" if polygon_usage["successful_calls"] > 0 or polygon_source_observed
+        else "degraded" if polygon_usage["failed_calls"] > 0
+        else "not_checked"
+    )
+    finnhub_status = usage_status(engine.finnhub, configured["Finnhub"])
+    sec_status = usage_status(engine.sec, configured["SEC API"])
+    yahoo_status = usage_status(engine.yf, True)
+    provider_rows = [
+        {"provider": "Polygon", "configured": configured["Polygon"], "source_variable": provider_source("Polygon"), "status": polygon_status, "last_successful_call": last_polygon_timestamp, "notes": f"{len(set(polygon_429 + in_memory_429))} ticker(s) rate limited"},
+        {"provider": "Tiingo", "configured": configured["Tiingo"], "source_variable": provider_source("Tiingo"), "status": tiingo_status, "last_successful_call": getattr(engine.tiingo, "pricing_last_successful_at", None) or getattr(engine.tiingo, "news_last_successful_at", None) or (scan_completed_at if tiingo_price_observed else None), "notes": tiingo_notes},
+        {"provider": "Yahoo/yfinance", "configured": True, "source_variable": "built_in", "status": yahoo_status, "last_successful_call": scan_completed_at if fundamentals else None, "notes": "Fundamentals and final delayed fallback"},
+        {"provider": "FRED", "configured": configured["FRED"], "source_variable": provider_source("FRED"), "status": fred_status, "last_successful_call": scan_completed_at if configured["FRED"] and modules.get("macro_pulse") and not fred_failures else None, "notes": fred_failure_reason or "All requested macro series succeeded.", "fred_key_loaded": fred_key_loaded, "series_requested": len(fred_requested), "series_succeeded": len(fred_successes), "series_failed": len(fred_failures), "failure_reason": fred_failure_reason},
+        {"provider": "Finnhub", "configured": configured["Finnhub"], "source_variable": provider_source("Finnhub"), "status": finnhub_status, "last_successful_call": scan_completed_at if provider_usage(engine.finnhub)["successful_calls"] else None, "notes": "Free company news/recommendations where available"},
+        {"provider": "NewsData", "configured": configured["NewsData"], "source_variable": provider_source("NewsData"), "status": newsdata_status, "last_successful_call": newsdata_last_success, "notes": newsdata_notes},
+        {"provider": "SEC API", "configured": configured["SEC API"], "source_variable": provider_source("SEC API"), "status": sec_status, "last_successful_call": scan_completed_at if provider_usage(engine.sec)["successful_calls"] else None, "notes": "Filings; EDGAR fallback exists"},
+        {"provider": "FMP", "configured": configured["FMP"], "source_variable": provider_source("FMP"), "status": fmp_status, "last_successful_call": getattr(engine.fmp, "last_successful_at", None), "notes": fmp_notes},
+        {"provider": "Alpha Vantage", "configured": configured["Alpha Vantage"], "source_variable": provider_source("Alpha Vantage"), "status": alpha_status, "last_successful_call": getattr(engine.alphavantage, "last_successful_at", None), "notes": alpha_notes},
+    ]
+
+    client_by_provider = {
+        "Polygon": engine.polygon,
+        "Tiingo": engine.tiingo,
+        "Yahoo/yfinance": engine.yf,
+        "FRED": engine.fred,
+        "Finnhub": engine.finnhub,
+        "NewsData": engine.newsdata,
+        "SEC API": engine.sec,
+        "FMP": engine.fmp,
+        "Alpha Vantage": engine.alphavantage,
+    }
+    provider_utilization = []
+    for row in provider_rows:
+        usage = provider_usage(client_by_provider.get(row["provider"]))
+        if row["status"] in {"not_configured", "rate_limited", "unauthorized"}:
+            utilization_status = row["status"]
+        elif usage["successful_calls"] > 0:
+            utilization_status = "fallback_used" if usage["fallback_activations"] > 0 else "available"
+        elif usage["failed_calls"] > 0:
+            utilization_status = "degraded"
+        elif usage["fallback_opportunities"] > 0:
+            utilization_status = "dormant_fallback"
+        else:
+            utilization_status = "not_checked"
+        provider_utilization.append({
+            "provider": row["provider"],
+            "requests_this_scan": usage["requests_this_scan"],
+            "successful_calls": usage["successful_calls"],
+            "failed_calls": usage["failed_calls"],
+            "fallback_activations": usage["fallback_activations"],
+            "status": utilization_status,
+        })
+    validation_by_provider = {
+        row.get("provider"): row
+        for row in getattr(engine, "provider_validation_results", [])
+        if isinstance(row, dict)
+    }
+    provider_connectivity = []
+    for provider, config_row in provider_configuration.items():
+        validation = validation_by_provider.get(provider, {})
+        provider_connectivity.append({
+            "provider": provider,
+            "configured": bool(config_row.get("configured")),
+            "connectivity": validation.get("connectivity") or ("not_checked" if config_row.get("configured") else "not_configured"),
+            "last_checked": validation.get("last_checked"),
+            "reason": sanitize_public_failure_reason(validation.get("reason", "")),
+        })
     module_rows = []
     report_age = parse_iso_age_hours(scan_completed_at or cache_timestamp)
     for module in CANONICAL_MODULES:
@@ -612,11 +908,29 @@ def audit_reliability_snapshot():
         "timestamp": now,
         "data_quality_score": round(data_quality_score, 1),
         "api_status": provider_rows,
+        "provider_utilization": provider_utilization,
+        "provider_connectivity": provider_connectivity,
         "price_source_coverage": [{"source": k, "count": v, "coverage_pct": round(v / max(total_expected_prices, 1) * 100, 2)} for k, v in source_counts.items()],
         "fallback_reasons": fallback_rows,
         "stale_data_warnings": stale_warnings,
         "last_successful_provider_call": provider_rows,
         "polygon_429_tracking": {"tickers": sorted(set(polygon_429 + in_memory_429)), "count": len(set(polygon_429 + in_memory_429))},
+        "fred_reliability": {
+            "configured": configured["FRED"],
+            "fred_key_loaded": fred_key_loaded,
+            "fred_env_file_loaded": bool(macro_pulse.get("fred_env_file_loaded")),
+            "fred_key_source": macro_pulse.get("fred_key_source"),
+            "status": fred_status,
+            "series_requested": fred_requested,
+            "requested_count": len(fred_requested),
+            "success_count": len(fred_successes),
+            "failure_count": len(fred_failures),
+            "successes": fred_successes,
+            "failures": fred_failures,
+            "failure_reason": fred_failure_reason,
+            "yield_curve_status": (macro_pulse.get("yield_curve") or {}).get("status"),
+            "yield_curve_failure_reason": (macro_pulse.get("yield_curve") or {}).get("failure_reason"),
+        },
         "cache_age": cache_rows,
         "module_freshness": module_rows,
         "coverage": {"priced_holdings": priced, "expected_holdings": total_expected_prices, "coverage_pct": round(coverage_score, 2)},
@@ -628,7 +942,7 @@ def latest_report_or_error():
     if not last_report:
         return None, {"error": "No cached report available. Run a full scan before exporting a report."}
     ensure_current_goal_module(last_report)
-    return last_report, None
+    return sanitize_report_public_payload(last_report), None
 
 
 def ensure_current_goal_module(report):
@@ -731,6 +1045,9 @@ def report_bundle():
         "drawdown": modules.get("drawdown_survival", {}),
         "goals": modules.get("goals_based", {}),
         "rebalancing": modules.get("rebalancing_intelligence", {}),
+        "framework_compliance": modules.get("framework_compliance", {}),
+        "position_sizing": modules.get("position_sizing", {}),
+        "staged_exit": modules.get("staged_exit_framework", {}),
         "narrative": modules.get("portfolio_narrative", {}),
         "memos": memos,
         "journal": journal,
@@ -839,11 +1156,20 @@ def report_layers(bundle):
                 {"title": "Factor-Linked Stress Scenarios", "table": (((committee.get("stress_dashboard") or {}).get("factor_linked_scenarios") or bundle["drawdown"].get("factor_linked_scenarios", [])), [("scenario", "Scenario"), ("shock_assumption", "Shock Assumption"), ("affected_factor_proxy", "Factor/Proxy"), ("estimated_portfolio_loss_pct", "Loss %"), ("estimated_dollar_loss", "Dollar Loss"), ("main_affected_holdings", "Affected Holdings"), ("confidence", "Confidence"), ("method_used", "Method")])},
                 {"title": "Goals Progress", "table": (bundle["goals"].get("goals", []), [("name", "Goal"), ("objective", "Objective"), ("portfolio_ytd_return_pct", "Portfolio YTD %"), ("spy_ytd_return_pct", "SPY YTD %"), ("cpi_inflation_estimate_pct", "CPI %"), ("excess_return_vs_spy_pct", "Excess vs SPY %"), ("real_return_after_inflation_pct", "Real Return %"), ("status", "Status"), ("risk_mismatch_warning", "Warning")])},
                 {"title": "Decision Queue", "table": (decision_queue, [("review_type", "Review Type"), ("category", "Category"), ("severity", "Severity"), ("reason", "Reason")])},
+                {"title": "Framework Compliance", "bullets": [
+                    f"Summary: {bundle['framework_compliance'].get('summary', {})}",
+                    f"Dominant issue: {(bundle['framework_compliance'].get('dominant_issue') or {}).get('rule_name', '--')}",
+                ], "table": (bundle["framework_compliance"].get("items", []), [("rule_name", "Rule"), ("status", "Status"), ("current_value", "Current"), ("threshold", "Threshold"), ("interpretation", "Interpretation"), ("review_action", "Review Action")])},
+                {"title": "Staged Exit Framework", "bullets": [
+                    f"Review position: {bundle['staged_exit'].get('target_ticker', '--')}",
+                    f"Active stage: {(bundle['staged_exit'].get('active_stage') or {}).get('stage', '--')}",
+                    f"Review action: {(bundle['staged_exit'].get('active_stage') or {}).get('suggested_review_action', '--')}",
+                ], "table": (bundle["staged_exit"].get("items", []), [("stage", "Stage"), ("trigger", "Trigger"), ("current_value", "Current"), ("threshold", "Threshold"), ("tradeoff", "Tradeoff"), ("suggested_review_action", "Review Action")])},
                 {"title": "Weekly Narrative", "bullets": [
                     f"Implicit bet: {narrative.get('implicit_bet', '--')}",
                     f"Main risks: {narrative.get('main_risks', '--')}",
-                    f"Strongest holdings: {', '.join(narrative.get('strongest_holdings', [])) or '--'}",
-                    f"Weakest holdings: {', '.join(narrative.get('weakest_holdings', [])) or '--'}",
+                    f"Key drivers: {', '.join(narrative.get('key_drivers') or narrative.get('strongest_holdings', [])) or '--'}",
+                    f"Risk laggards: {', '.join(narrative.get('risk_laggards') or narrative.get('weakest_holdings', [])) or '--'}",
                     f"Market context: {market_context_summary or '--'}",
                     f"What to watch next: {narrative.get('what_to_watch_next', '--')}",
                 ]},
@@ -870,10 +1196,20 @@ def report_layers(bundle):
                     f"Information ratio: {bundle['benchmark'].get('information_ratio', '--')}",
                 ], "table": (bundle["benchmark"].get("items", []), [("ticker", "Ticker"), ("weight_pct", "Weight %"), ("asset_return_pct", "Asset Return %"), ("active_contribution_pct", "Active Contribution %"), ("relative_result", "Result")])},
                 {"title": "Capital Efficiency", "bullets": [f"Average efficiency score: {bundle['capital'].get('average_efficiency_score', '--')}"], "table": (bundle["capital"].get("items", []), [("ticker", "Ticker"), ("capital_efficiency_score", "Score"), ("label", "Label"), ("decision_option", "Decision Option")])},
+                {"title": "Position Sizing", "bullets": [
+                    f"Cash available: {bundle['position_sizing'].get('cash', '--')}",
+                    f"Cash allocation: {bundle['position_sizing'].get('cash_pct', '--')}%",
+                    f"Dominant factor: {bundle['position_sizing'].get('dominant_factor', '--')}",
+                ], "table": (bundle["position_sizing"].get("items", []), [("ticker", "Ticker"), ("candidate_factor_group", "Factor Group"), ("candidate_volatility_pct", "Vol %"), ("candidate_correlation_with_portfolio", "Corr"), ("conservative_cash_required", "Conservative $"), ("balanced_cash_required", "Balanced $"), ("aggressive_cash_required", "Aggressive $"), ("cash_available", "Cash Available"), ("remaining_cash_after_balanced", "Cash After Balanced"), ("cash_feasibility_warning", "Cash Warning"), ("warning", "Factor Warning")])},
                 {"title": "Macro Regime", "bullets": [
-                    f"Primary regime: {bundle['macro_regime'].get('primary_regime', '--')}",
-                    f"Allocation posture: {bundle['macro_regime'].get('allocation_posture', '--')}",
-                    f"Evidence: {'; '.join(bundle['macro_regime'].get('evidence', [])) or '--'}",
+                    f"Current regime: {bundle['macro_regime'].get('current_regime', '--')}",
+                    f"Confidence score: {bundle['macro_regime'].get('confidence_score', '--')}%",
+                    f"Data coverage: {bundle['macro_regime'].get('available_indicator_count', '--')} of {bundle['macro_regime'].get('required_indicator_count', 9)} indicators",
+                    f"Status: {bundle['macro_regime'].get('status', '--')}",
+                    f"Interpretation: {bundle['macro_regime'].get('interpretation', '--')}",
+                    f"Supporting indicators: {'; '.join(item.get('explanation', '') for item in bundle['macro_regime'].get('supporting_indicators', [])) or '--'}",
+                    f"Contradicting indicators: {'; '.join(item.get('explanation', '') for item in bundle['macro_regime'].get('contradicting_indicators', [])) or '--'}",
+                    f"Reason: {bundle['macro_regime'].get('reason') or 'Full macro regime evidence available.'}",
                 ], "table": (bundle["macro_regime"].get("indicators", []), [("indicator", "Indicator"), ("latest", "Latest"), ("trend", "Trend"), ("regime_read", "Read")])},
             ],
         },
@@ -889,9 +1225,13 @@ def report_layers(bundle):
                 {"title": "Signal & Action Plan", "table": (bundle["signal_action"].get("items", []), [("ticker", "Ticker"), ("signal_score", "Score"), ("action_label", "Action Label"), ("confidence", "Confidence"), ("reasons", "Reasons")])},
                 {"title": "Portfolio Conviction Matrix summary", "table": (bundle["conviction"].get("items", []), [("ticker", "Ticker"), ("fundamental_quality_score", "Quality"), ("momentum_technical_score", "Momentum"), ("portfolio_weight_pct", "Weight %"), ("quadrant", "Quadrant")])},
                 {"title": "Macro Pulse", "bullets": [
+                    f"FRED key loaded: {bundle['macro_pulse'].get('fred_key_loaded', '--')}",
+                    f"FRED key source: {bundle['macro_pulse'].get('fred_key_source', '--')}",
+                    f"FRED successful series: {len(bundle['macro_pulse'].get('fred_succeeded_series', []))}",
                     f"10Y-2Y spread: {(bundle['macro_pulse'].get('yield_curve') or {}).get('spread_10y_2y', '--')}",
                     f"10Y-3M spread: {(bundle['macro_pulse'].get('yield_curve') or {}).get('spread_10y_3m', '--')}",
                     f"Doctor Copper signal: {(bundle['macro_pulse'].get('doctor_copper') or {}).get('signal', '--')}",
+                    f"FRED failures: {bundle['macro_pulse'].get('fred_failure_count', 0)}",
                 ]},
                 {"title": "Insiders & Filings", "table": (bundle["insiders"].get("items", []) or bundle["insiders"].get("filings", []), [("ticker", "Ticker"), ("source", "Source"), ("date", "Date"), ("summary", "Summary")])},
             ],
@@ -907,9 +1247,12 @@ def report_layers(bundle):
                 ]},
                 {"title": "Price Audit", "table": (bundle["price_audit"].get("items", []), [("ticker", "Ticker"), ("source_used", "Source Used"), ("fallback_reason", "Fallback Reason"), ("polygon_failure_reason", "Polygon Failure"), ("last_successful_polygon_timestamp", "Last Polygon Success")])},
                 {"title": "data freshness", "table": (audit.get("module_freshness", []), [("module", "Module"), ("status", "Status"), ("age_hours", "Age Hours")])},
-                {"title": "provider status", "table": (audit.get("api_status", []), [("provider", "Provider"), ("configured", "Configured"), ("status", "Status"), ("last_successful_call", "Last Success"), ("notes", "Notes")])},
+                {"title": "provider status", "table": (audit.get("api_status", []), [("provider", "Provider"), ("configured", "Configured"), ("source_variable", "Source Variable"), ("status", "Status"), ("last_successful_call", "Last Success"), ("notes", "Notes")])},
+                {"title": "provider utilization", "table": (audit.get("provider_utilization", []), [("provider", "Provider"), ("requests_this_scan", "Requests This Scan"), ("successful_calls", "Successful Calls"), ("failed_calls", "Failed Calls"), ("fallback_activations", "Fallback Activations"), ("status", "Status")])},
+                {"title": "provider connectivity", "table": (audit.get("provider_connectivity", []), [("provider", "Provider"), ("configured", "Configured"), ("connectivity", "Connectivity"), ("last_checked", "Last Checked"), ("reason", "Reason")])},
                 {"title": "fallback reasons", "table": (audit.get("fallback_reasons", []), [("ticker", "Ticker"), ("source_used", "Source Used"), ("fallback_reason", "Fallback Reason"), ("polygon_failure_reason", "Polygon Failure")])},
                 {"title": "stale data warnings", "table": (audit.get("stale_data_warnings", []), [("scope", "Scope"), ("warning", "Warning")])},
+                {"title": "FRED failure reasons", "table": ((audit.get("fred_reliability") or {}).get("failures", []), [("indicator", "Indicator"), ("series", "Series"), ("reason", "Failure Reason")])},
             ],
         },
         {
@@ -920,7 +1263,7 @@ def report_layers(bundle):
                 {"title": "Behavioral Check", "bullets": [
                     f"Overall grade: {bundle['behavioral'].get('overall_grade', '--')}",
                     f"Average bias score: {bundle['behavioral'].get('avg_score', '--')}",
-                    f"Concentration flag: {bundle['behavioral'].get('concentration_warning', '--')}",
+                    f"LITE special flag: {bundle['behavioral'].get('lite_special_flag', '--')}",
                     f"Devil's advocate: {bundle['behavioral'].get('devils_advocate', '--')}",
                 ]},
                 {"title": "open review items", "table": (open_reviews, [("review_type", "Review Type"), ("category", "Category"), ("severity", "Severity"), ("reason", "Reason")])},
@@ -1097,7 +1440,7 @@ def get_last_report():
         return jsonify({"error": "No report available. Run a scan first."}), 404
     ensure_current_goal_module(last_report)
     return jsonify({
-        "report": last_report,
+        "report": sanitize_report_public_payload(last_report),
         "timestamp": scan_completed_at or cache_timestamp,
         "scan_started_at": scan_started_at,
         "scan_completed_at": scan_completed_at,
@@ -1115,7 +1458,7 @@ def get_portfolio():
         "polymarket": config.POLYMARKET,
         "prospective": config.PROSPECTIVE,
         "buying_power": config.BUYING_POWER,
-        "tax_context": "Tax treatment depends on investor residency and jurisdiction.",
+        "tax_context": config.TAX_CONTEXT,
         "special_flags": config.SPECIAL_FLAGS,
     })
 
@@ -1133,6 +1476,15 @@ def get_family_office():
 @app.route("/api/audit-reliability")
 def get_audit_reliability():
     return jsonify(audit_reliability_snapshot())
+
+
+@app.route("/api/provider-validation", methods=["GET", "POST"])
+def provider_validation():
+    results = engine.validate_providers() if request.method == "POST" else getattr(engine, "provider_validation_results", [])
+    return jsonify({
+        "items": sanitize_report_public_payload(results),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def add_pdf_table(story, rows, columns, styles, title=None, limit=14):
@@ -1452,6 +1804,10 @@ def dashboard():
   }
   textarea { min-height: 74px; resize: vertical; }
   .empty { padding: 58px 16px; text-align:center; color: var(--muted); font: 600 12px "JetBrains Mono", monospace; }
+  .audit-empty {
+    margin-top: 6px; padding: 7px 9px; border-left: 2px solid #273441; background: #070707;
+    color: var(--muted); font: 600 10px/1.4 "JetBrains Mono", monospace;
+  }
   .spinner {
     width: 26px; height: 26px; border-radius: 999px; display:inline-block;
     border: 2px solid #142316; border-top-color: var(--green);
@@ -1525,9 +1881,11 @@ const MODULE_GROUPS = [
       {id:'wealth_view', label:'Wealth View'},
       {id:'family_office', label:'Family Office'},
       {id:'policy_allocation', label:'Allocation Drift'},
+      {id:'framework_compliance', label:'Framework Compliance'},
       {id:'drawdown_survival', label:'Stress Dashboard'},
       {id:'goals_based', label:'Goals Progress'},
       {id:'rebalancing_intelligence', label:'Decision Queue'},
+      {id:'staged_exit_framework', label:'Staged Exit Framework'},
       {id:'portfolio_narrative', label:'Weekly Narrative'}
     ]
   },
@@ -1544,6 +1902,7 @@ const MODULE_GROUPS = [
       {id:'factor_exposure', label:'Factor Exposure'},
       {id:'benchmark_attribution', label:'Benchmark Attribution'},
       {id:'capital_efficiency', label:'Capital Efficiency'},
+      {id:'position_sizing', label:'Position Sizing'},
       {id:'macro_regime', label:'Macro Regime'}
     ]
   },
@@ -1633,8 +1992,8 @@ function metric(label, value, suffix='') {
   return `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${val(value, suffix)}</div></div>`;
 }
 
-function table(rows, cols) {
-  if (!rows || !rows.length) return '<div class="empty">No rows returned.</div>';
+function table(rows, cols, emptyMessage='No entries available.') {
+  if (!rows || !rows.length) return `<div class="empty">${esc(emptyMessage)}</div>`;
   return `<table><thead><tr>${cols.map(c => `<th>${esc(c.label)}</th>`).join('')}</tr></thead><tbody>` +
     rows.map(r => `<tr>${cols.map(c => `<td>${c.render ? c.render(r) : val(r[c.key])}</td>`).join('')}</tr>`).join('') +
     '</tbody></table>';
@@ -1695,6 +2054,23 @@ function selectPortfolio(id) {
 async function loadAuditReliability() {
   auditReliabilityData = await fetch('/api/audit-reliability').then(r=>r.json()).catch(()=>({}));
   moduleData.audit_reliability = auditReliabilityData;
+}
+
+async function runProviderValidation(button) {
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Validating...';
+  }
+  try {
+    await fetch('/api/provider-validation', {method:'POST'});
+    await loadAuditReliability();
+    renderContent();
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Validate Providers';
+    }
+  }
 }
 
 async function refreshReport() {
@@ -1759,12 +2135,12 @@ function renderHoldings() {
     const weight = s.portfolio_weight_pct ?? (s.market_value && total ? s.market_value / total * 100 : null);
     const source = s.price_source || 'pending';
     const session = s.market_session || '';
-    const concentrationWarn = portfolioMeta.special_flags?.[p.ticker] ? '<div class="warn-badge">Concentration Review</div>' : '';
-    return `<div class="holding ${portfolioMeta.special_flags?.[p.ticker] ? 'selected' : ''}">
+    const liteWarn = p.ticker === 'LITE' ? '<div class="warn-badge">Concentration Review</div>' : '';
+    return `<div class="holding ${p.ticker === 'LITE' ? 'selected' : ''}">
       <div class="ticker"><strong>${esc(p.ticker)}</strong><span>${weight != null ? fmt.format(weight) + '%' : 'pending'}</span></div>
       <div class="pnl ${clsNum(pnl)}">${pnl != null ? fmt.format(pnl) + '%' : '--'}</div>
       <div class="small">${price != null ? money.format(price) : 'price pending'} · ${esc(source)} ${session ? '· ' + esc(session) : ''}</div>
-      ${concentrationWarn}
+      ${liteWarn}
     </div>`;
   }).join('');
 }
@@ -1888,6 +2264,9 @@ function renderContent() {
     drawdown_survival: renderDrawdownSurvival,
     goals_based: renderGoalsBased,
     rebalancing_intelligence: renderRebalancingIntelligence,
+    framework_compliance: renderFrameworkCompliance,
+    position_sizing: renderPositionSizing,
+    staged_exit_framework: renderStagedExitFramework,
     portfolio_narrative: renderPortfolioNarrative,
     risk_analytics: renderRisk,
     macro_regime: renderMacroRegime,
@@ -1945,13 +2324,26 @@ function renderMacro(data) {
   const dc = data.doctor_copper || {};
   const rows = Object.entries(data.indicators || {}).map(([k,v]) => ({name:k.replaceAll('_',' '), ...v}));
   return `<div class="metrics">
+    ${metric('FRED Key Loaded', data.fred_key_loaded ? 'YES' : 'NO')}
+    ${metric('.env Loaded', data.fred_env_file_loaded ? 'YES' : 'NO')}
+    ${metric('FRED Successes', (data.fred_succeeded_series || []).length)}
+    ${metric('FRED Failures', data.fred_failure_count ?? 0)}
     ${metric('10Y-2Y', yc.spread_10y_2y, '%')}
     ${metric('10Y-3M', yc.spread_10y_3m, '%')}
     ${metric('Curve Inverted', yc.inverted ? 'YES' : 'NO')}
     ${metric('Copper Signal', dc.signal || '--')}
-  </div>` + table(rows, [
+  </div>
+  <div class="news-item"><div class="news-meta">FRED Key Source</div><div class="news-title">${esc(data.fred_key_source || '--')}</div></div>
+  ${yc.failure_reason ? `<div class="warning">${esc(yc.failure_reason)}</div>` : ''}
+  ${(data.fred_succeeded_series || []).length ? `<h3 class="panel-title" style="margin-top:16px">FRED Successful Series</h3>${table(data.fred_succeeded_series || [], [
+    {key:'indicator', label:'Indicator'}, {key:'series', label:'Series'}, {key:'date', label:'Latest Date'}
+  ])}` : ''}
+  ${(data.fred_failures || []).length ? `<h3 class="panel-title" style="margin-top:16px">FRED Failure Reasons</h3>${table(data.fred_failures || [], [
+    {key:'indicator', label:'Indicator'}, {key:'series', label:'Series'}, {key:'reason', label:'Reason'}
+  ])}` : ''}` + table(rows, [
     {key:'name', label:'Indicator'}, {key:'series', label:'FRED'}, {key:'latest', label:'Latest'},
-    {key:'change', label:'Change'}, {key:'trend', label:'Trend'}, {key:'date', label:'Date'}
+    {key:'change', label:'Change'}, {key:'trend', label:'Trend'}, {key:'date', label:'Date'},
+    {key:'status', label:'Status'}, {key:'failure_reason', label:'Failure Reason'}
   ]);
 }
 
@@ -1978,11 +2370,11 @@ function renderFundamentals(data) {
   const rows = Object.entries(data.stocks || {}).map(([ticker, s]) => ({ticker, ...s}));
   return `<div class="metrics">
     ${metric('Buying Power', data.buying_power)}
-    ${metric('Largest Weight', rows.length ? Math.max(...rows.map(r=>Number(r.portfolio_weight_pct)||0)) : null, '%')}
-    ${metric('Tax Context', 'Jurisdiction-specific')}
+    ${metric('LITE Flag', rows.find(r=>r.ticker==='LITE')?.portfolio_weight_pct, '%')}
+    ${metric('Tax Context', 'F-1 NRA')}
     ${metric('Holdings', rows.length)}
   </div>` + table(rows, [
-    {key:'ticker', label:'Ticker', render:r => `<span class="${r.special_flag?'pos':'neu'}">${esc(r.ticker)}</span>`},
+    {key:'ticker', label:'Ticker', render:r => `<span class="${r.ticker==='LITE'?'pos':'neu'}">${esc(r.ticker)}</span>`},
     {key:'price', label:'Price', render:r => money.format(r.price || 0)},
     {key:'price_source', label:'Source'},
     {key:'market_session', label:'Session'},
@@ -2016,39 +2408,70 @@ function renderRisk(data) {
 function renderAuditReliability(data) {
   const p429 = data.polygon_429_tracking || {};
   const coverage = data.coverage || {};
+  const fred = data.fred_reliability || {};
+  const auditSection = (title, rows, cols, emptyMessage, hideWhenEmpty=false) => {
+    if ((!rows || !rows.length) && hideWhenEmpty) return '';
+    const body = rows && rows.length
+      ? table(rows, cols)
+      : `<div class="audit-empty">${esc(emptyMessage)}</div>`;
+    return `<h3 class="panel-title" style="margin-top:16px">${esc(title)}</h3>${body}`;
+  };
   return `<div class="metrics">
     ${metric('Data Quality', data.data_quality_score)}
     ${metric('Price Coverage', coverage.coverage_pct, '%')}
     ${metric('Polygon 429s', p429.count || 0)}
+    ${metric('FRED Key Loaded', fred.fred_key_loaded ? 'YES' : 'NO')}
+    ${metric('FRED Configured', fred.configured ? 'YES' : 'NO')}
+    ${metric('FRED Requested', fred.requested_count || 0)}
+    ${metric('FRED Successes', fred.success_count || 0)}
+    ${metric('FRED Failures', fred.failure_count || 0)}
     ${metric('Warnings', (data.stale_data_warnings || []).length)}
   </div>
+  <div style="margin-top:12px"><button class="btn secondary" onclick="runProviderValidation(this)">Validate Providers</button></div>
   <div class="news-item"><div class="news-meta">Reliability Note</div><div class="news-title">${esc(data.notes || '')}</div></div>
-  <h3 class="panel-title" style="margin-top:16px">API Status by Provider</h3>
-  ${table(data.api_status || [], [
-    {key:'provider', label:'Provider'}, {key:'configured', label:'Configured'}, {key:'status', label:'Status'},
+  <h3 class="panel-title" style="margin-top:16px">FRED / Macro Reliability</h3>
+  <div class="news-item"><div class="news-meta">FRED Status</div><div class="news-title">status=${esc(fred.status || '--')} · configured=${esc(String(!!fred.configured))} · key_loaded=${esc(String(!!fred.fred_key_loaded))}</div></div>
+  <div class="news-item"><div class="news-meta">FRED Key</div><div class="news-title">env_file_loaded=${esc(String(!!fred.fred_env_file_loaded))} · source=${esc(fred.fred_key_source || '--')}</div></div>
+  <div class="news-item"><div class="news-meta">FRED Failure Reason</div><div class="news-title">${esc(fred.failure_reason || 'No FRED failure reported.')}</div></div>
+  <div class="news-item"><div class="news-meta">Yield Curve</div><div class="news-title">${esc(fred.yield_curve_status || '--')} · ${esc(fred.yield_curve_failure_reason || 'No yield-curve failure reported.')}</div></div>
+  ${auditSection('Requested FRED Indicators', fred.series_requested || [], [
+    {key:'indicator', label:'Requested Indicator'}, {key:'series', label:'Series'}
+  ], 'No requested FRED indicators configured.')}
+  ${auditSection('Successful FRED Events', fred.successes || [], [
+    {key:'indicator', label:'Succeeded Indicator'}, {key:'series', label:'Series'}, {key:'date', label:'Latest Date'}
+  ], 'No macro reliability events requiring review.')}
+  ${auditSection('FRED Provider Failures', fred.failures || [], [
+    {key:'indicator', label:'Indicator'}, {key:'series', label:'Series'}, {key:'reason', label:'Failure Reason'}
+  ], 'No provider failure events recorded.')}
+  ${auditSection('API Status by Provider', data.api_status || [], [
+    {key:'provider', label:'Provider'}, {key:'configured', label:'Configured'}, {key:'source_variable', label:'Source Variable'}, {key:'status', label:'Status'},
     {key:'last_successful_call', label:'Last Success', render:r => r.last_successful_call ? new Date(r.last_successful_call).toLocaleString() : '<span class="muted">--</span>'},
     {key:'notes', label:'Notes'}
-  ])}
-  <h3 class="panel-title" style="margin-top:16px">Price Source Coverage</h3>
-  ${table(data.price_source_coverage || [], [
+  ], 'No provider audit entries available.')}
+  ${auditSection('Provider Utilization', data.provider_utilization || [], [
+    {key:'provider', label:'Provider'}, {key:'requests_this_scan', label:'Requests'}, {key:'successful_calls', label:'Successful'},
+    {key:'failed_calls', label:'Failed'}, {key:'fallback_activations', label:'Fallbacks'}, {key:'status', label:'Status'}
+  ], 'No provider activity recorded for this scan.')}
+  ${auditSection('Provider Connectivity', data.provider_connectivity || [], [
+    {key:'provider', label:'Provider'}, {key:'configured', label:'Configured'}, {key:'connectivity', label:'Connectivity'},
+    {key:'last_checked', label:'Last Checked', render:r => r.last_checked ? new Date(r.last_checked).toLocaleString() : '<span class="muted">Not checked</span>'},
+    {key:'reason', label:'Reason'}
+  ], 'No provider validation results available.')}
+  ${auditSection('Price Source Coverage', data.price_source_coverage || [], [
     {key:'source', label:'Source'}, {key:'count', label:'Count'}, {key:'coverage_pct', label:'Coverage %'}
-  ])}
-  <h3 class="panel-title" style="margin-top:16px">Fallback Reasons</h3>
-  ${table(data.fallback_reasons || [], [
+  ], 'No price-source coverage entries available.')}
+  ${auditSection('Fallback Reasons', data.fallback_reasons || [], [
     {key:'ticker', label:'Ticker'}, {key:'source_used', label:'Source Used'}, {key:'fallback_reason', label:'Fallback Reason'}, {key:'polygon_failure_reason', label:'Polygon Failure'}
-  ])}
-  <h3 class="panel-title" style="margin-top:16px">Stale Data Warnings</h3>
-  ${table(data.stale_data_warnings || [], [
+  ], 'No provider failures detected.')}
+  ${auditSection('Stale Data Warnings', data.stale_data_warnings || [], [
     {key:'scope', label:'Scope'}, {key:'warning', label:'Warning'}
-  ])}
-  <h3 class="panel-title" style="margin-top:16px">Cache Age</h3>
-  ${table(data.cache_age || [], [
+  ], 'No stale data warnings.')}
+  ${auditSection('Cache Age', data.cache_age || [], [
     {key:'cache', label:'Cache'}, {key:'age_hours', label:'Age Hours'}, {key:'status', label:'Status'}
-  ])}
-  <h3 class="panel-title" style="margin-top:16px">Module Freshness</h3>
-  ${table(data.module_freshness || [], [
+  ], 'No cache audit entries available.')}
+  ${auditSection('Module Freshness', data.module_freshness || [], [
     {key:'module', label:'Module'}, {key:'status', label:'Status'}, {key:'age_hours', label:'Age Hours'}
-  ])}`;
+  ], 'No module freshness entries available.')}`;
 }
 
 function renderInvestmentCommittee(data) {
@@ -2118,7 +2541,7 @@ function renderPolicyAllocation(data) {
     ${metric('Policy Breaches', (data.breaches || []).length)}
     ${metric('Benchmark', data.policy?.target_benchmark || '--')}
   </div>
-  ${data.concentration_warning ? `<div class="warning">${esc(data.concentration_warning)}</div>` : ''}
+  ${data.lite_warning ? `<div class="warning">${esc(data.lite_warning)}</div>` : ''}
   <h3 class="panel-title">Policy Breaches</h3>
   ${table(data.breaches || [], [
     {key:'type', label:'Type'}, {key:'name', label:'Name'}, {key:'actual', label:'Actual %'},
@@ -2137,6 +2560,77 @@ function renderPolicyAllocation(data) {
   ${table(Object.entries(data.theme_weights || {}).map(([name, weight]) => ({name, weight})), [
     {key:'name', label:'Theme'}, {key:'weight', label:'Weight %'}
   ])}`;
+}
+
+function renderFrameworkCompliance(data) {
+  const summary = data.summary || {};
+  const dominant = data.dominant_issue || {};
+  return `<div class="metrics">
+    ${metric('PASS', summary.pass ?? 0)}
+    ${metric('WATCH', summary.watch ?? 0)}
+    ${metric('ACTIVE', summary.active ?? 0)}
+    ${metric('BREACH', summary.breach ?? 0)}
+  </div>
+  <div class="news-item"><div class="news-meta">Dominant Rule</div><div class="news-title">${esc(dominant.rule_name || '--')} · ${esc(dominant.status || '--')} · ${esc(dominant.review_action || '')}</div></div>
+  ${table(data.items || [], [
+    {key:'rule_name', label:'Rule'}, {key:'status', label:'Status'}, {key:'current_value', label:'Current'},
+    {key:'threshold', label:'Threshold'}, {key:'interpretation', label:'Interpretation'}, {key:'review_action', label:'Review Action'}
+  ])}
+  <div class="panel-note" style="margin-top:12px">${esc(data.disclaimer || 'Not investment advice.')}</div>`;
+}
+
+function renderPositionSizing(data) {
+  const rows = data.items || [];
+  const allRows = data.all_items || rows;
+  return `<div class="metrics">
+    ${metric('Portfolio Value', data.portfolio_value)}
+    ${metric('Cash', data.cash)}
+    ${metric('Cash %', data.cash_pct, '%')}
+    ${metric('Dominant Factor', data.dominant_factor || '--')}
+  </div>
+  <div class="panel-note">${esc(data.default_filter_note || '')}</div>
+  ${table(rows, [
+    {key:'ticker', label:'Ticker'}, {key:'candidate_factor_group', label:'Factor Group'},
+    {key:'candidate_volatility_pct', label:'Vol %'}, {key:'candidate_correlation_with_portfolio', label:'Corr'},
+    {key:'conservative_cash_required', label:'Conservative $'}, {key:'balanced_cash_required', label:'Balanced $'},
+    {key:'aggressive_cash_required', label:'Aggressive $'}, {key:'cash_available', label:'Cash Available'},
+    {key:'remaining_cash_after_balanced', label:'Cash After Balanced'}, {key:'cash_feasibility_warning', label:'Cash Warning'},
+    {key:'warning', label:'Factor Warning'}
+  ])}
+  <h3 class="panel-title" style="margin-top:16px">Sizing Effects</h3>
+  ${table(rows, [
+    {key:'ticker', label:'Ticker'}, {key:'expected_effect_on_concentration', label:'Concentration Effect'},
+    {key:'expected_effect_on_factor_exposure', label:'Factor Effect'}, {key:'requires_selling_note', label:'Funding Note'}, {key:'method', label:'Method'}
+  ])}
+  ${detailPanel('Show full watchlist sizing', table(allRows, [
+    {key:'ticker', label:'Ticker'}, {key:'candidate_factor_group', label:'Factor Group'}, {key:'balanced_size_pct', label:'Balanced %'},
+    {key:'aggressive_size_pct', label:'Aggressive %'}, {key:'balanced_cash_required', label:'Balanced $'}, {key:'aggressive_cash_required', label:'Aggressive $'},
+    {key:'remaining_cash_after_aggressive', label:'Cash After Aggressive'}, {key:'candidate_volatility_pct', label:'Vol %'}, {key:'candidate_correlation_with_portfolio', label:'Corr'},
+    {key:'cash_feasibility_warning', label:'Cash Warning'}, {key:'warning', label:'Factor Warning'}, {key:'history_used', label:'History Used'}
+  ]))}
+  <div class="panel-note" style="margin-top:12px">${esc(data.disclaimer || 'Not investment advice.')}</div>`;
+}
+
+function renderStagedExitFramework(data) {
+  const active = data.active_stage || {};
+  const inputs = data.inputs || {};
+  return `<div class="metrics">
+    ${metric('Review Position', data.target_ticker || '--')}
+    ${metric('Weight', inputs.position_weight_pct, '%')}
+    ${metric('Risk Contribution', inputs.risk_contribution_pct, '%')}
+    ${metric('Gain Since Cost', inputs.gain_since_cost_basis_pct, '%')}
+  </div>
+  <div class="news-item"><div class="news-meta">Active Review Stage</div><div class="news-title">${esc(active.stage || '--')} · ${esc(active.suggested_review_action || '')}</div></div>
+  ${table(data.items || [], [
+    {key:'stage', label:'Stage'}, {key:'trigger', label:'Trigger'}, {key:'current_value', label:'Current'},
+    {key:'threshold', label:'Threshold'}, {key:'tradeoff', label:'Tradeoff'}, {key:'suggested_review_action', label:'Review Action'},
+    {key:'active', label:'Active'}
+  ])}
+  <h3 class="panel-title" style="margin-top:16px">Inputs</h3>
+  ${table(Object.entries(inputs).map(([name, value]) => ({name, value})), [
+    {key:'name', label:'Input'}, {key:'value', label:'Value'}
+  ])}
+  <div class="panel-note" style="margin-top:12px">${esc(data.disclaimer || 'Not investment advice.')}</div>`;
 }
 
 function renderDrawdownSurvival(data) {
@@ -2193,19 +2687,21 @@ function renderRebalancingIntelligence(data) {
 }
 
 function renderPortfolioNarrative(data) {
+  const keyDrivers = data.key_drivers || data.strongest_holdings || [];
+  const riskLaggards = data.risk_laggards || data.weakest_holdings || [];
   const rows = [
     ['Implicit Bet', data.implicit_bet],
     ['Main Risks', data.main_risks],
-    ['Strongest Holdings', (data.strongest_holdings || []).join(', ')],
-    ['Weakest Holdings', (data.weakest_holdings || []).join(', ')],
+    ['Key Drivers', keyDrivers.join(', ')],
+    ['Risk Laggards', riskLaggards.join(', ')],
     ['Macro Backdrop', data.macro_backdrop],
     ['Changed This Week', data.what_changed_this_week],
     ['Watch Next', data.what_to_watch_next]
   ];
   return `<div class="metrics">
     ${metric('Liquidity Grade', data.liquidity_concentration_grade || '--')}
-    ${metric('Strongest', (data.strongest_holdings || []).length)}
-    ${metric('Weakest', (data.weakest_holdings || []).length)}
+    ${metric('Key Drivers', keyDrivers.length)}
+    ${metric('Risk Laggards', riskLaggards.length)}
     ${metric('Tone', 'Analytical')}
   </div>
   <div class="news-list">${rows.map(([k,v]) => `<div class="news-item"><div class="news-meta">${esc(k)}</div><div class="news-title">${esc(v || '--')}</div></div>`).join('')}</div>`;
@@ -2242,21 +2738,33 @@ function renderLiquidityConcentration(data) {
 function renderMacroRegime(data) {
   const scores = Object.entries(data.scores || {}).map(([regime, score]) => ({regime, score}));
   const curve = data.yield_curve || {};
-  return `<div class="metrics">
-    ${metric('Primary Regime', data.primary_regime || '--')}
+  const supporting = data.supporting_indicators || [];
+  const contradicting = data.contradicting_indicators || [];
+  return `${degradedBanner(data)}<div class="metrics">
+    ${metric('Current Regime', data.current_regime || '--')}
+    ${metric('Confidence', data.confidence_score, '%')}
+    ${metric('Data Coverage', data.coverage_pct, '%')}
     ${metric('10Y-2Y', curve.spread_10y_2y, '%')}
     ${metric('10Y-3M', curve.spread_10y_3m, '%')}
     ${metric('Curve Inverted', curve.inverted ? 'YES' : 'NO')}
   </div>
-  <div class="news-item"><div class="news-meta">Allocation Posture</div><div class="news-title">${esc(data.allocation_posture || '')}</div></div>
+  <div class="news-item"><div class="news-meta">Decision-Support Interpretation</div><div class="news-title">${esc(data.interpretation || data.allocation_posture || '')}</div></div>
+  ${data.reason ? `<div class="warning">${esc(data.reason)}</div>` : ''}
   <h3 class="panel-title" style="margin-top:16px">Regime Scorecard</h3>
-  ${table(scores, [{key:'regime', label:'Regime'}, {key:'score', label:'Score'}])}
+  ${table(scores, [{key:'regime', label:'Regime'}, {key:'score', label:'Score'}], 'No regime scores available.')}
+  <h3 class="panel-title" style="margin-top:16px">Supporting Indicators</h3>
+  ${table(supporting, [
+    {key:'indicator', label:'Indicator'}, {key:'points', label:'Weight'}, {key:'explanation', label:'Evidence'}
+  ], 'No supporting indicators available.')}
+  <h3 class="panel-title" style="margin-top:16px">Contradicting Indicators</h3>
+  ${table(contradicting, [
+    {key:'indicator', label:'Indicator'}, {key:'supports_regime', label:'Supports'}, {key:'explanation', label:'Evidence'}
+  ], 'No material contradictions detected.')}
   <h3 class="panel-title" style="margin-top:16px">Macro Evidence</h3>
   ${table(data.indicators || [], [
     {key:'indicator', label:'Indicator'}, {key:'latest', label:'Latest'}, {key:'previous', label:'Previous'},
     {key:'trend', label:'Trend'}, {key:'regime_read', label:'Read'}
-  ])}
-  <div class="news-list" style="margin-top:12px">${(data.evidence || []).map(x => `<div class="news-item"><div class="news-title">${esc(x)}</div></div>`).join('')}</div>
+  ], 'Macro indicator data unavailable.')}
   <div class="panel-note" style="margin-top:12px">${esc(data.disclaimer || '')}</div>`;
 }
 
@@ -2417,9 +2925,9 @@ function renderRiskContribution(data) {
     ${metric('Portfolio Vol', data.portfolio_annual_volatility_pct, '%')}
     ${metric('1W VaR', data.portfolio_var_1w_pct, '%')}
     ${metric('Positions', rows.length)}
-    ${metric('Largest Risk', rows.length ? Math.max(...rows.map(r=>Number(r.volatility_contribution_pct)||0)) : null, '%')}
+    ${metric('LITE Flag', rows.find(r=>r.ticker==='LITE')?.volatility_contribution_pct, '%')}
   </div>
-  ${data.concentration_warning ? `<div class="warning">${esc(data.concentration_warning)}</div>` : ''}
+  ${data.lite_warning ? `<div class="warning">${esc(data.lite_warning)}</div>` : ''}
   ${contributionBars(rows, 'volatility_contribution_pct')}
   ${table(rows, [
     {key:'ticker', label:'Ticker'}, {key:'portfolio_weight_pct', label:'Weight %'}, {key:'volatility_contribution_pct', label:'Risk Contrib %'},
@@ -2472,7 +2980,7 @@ function renderSignalActionPlan(data) {
   </div>
   ${renderSignalChart(rows)}
   <div class="news-item"><div class="news-meta">Disclaimer</div><div class="news-title">${esc(data.disclaimer || 'Not investment advice.')}</div></div>
-  ${data.concentration_warning ? `<div class="news-item"><div class="news-meta">Concentration Warning</div><div class="news-title pos">${esc(data.concentration_warning)}</div></div>` : ''}
+  <div class="news-item"><div class="news-meta">LITE Warning</div><div class="news-title pos">${esc(data.lite_warning || '')}</div></div>
   ${table(rows, [
     {key:'ticker', label:'Ticker'}, {key:'signal_score', label:'Score'}, {key:'action', label:'Action'},
     {key:'confidence', label:'Confidence'}, {key:'return_1m', label:'1M %'}, {key:'return_3m', label:'3M %'},
@@ -2498,14 +3006,14 @@ function renderSignalChart(rows) {
 
 function renderConvictionMatrix(data) {
   const rows = data.items || [];
-  const concentration = rows.find(r => r.warning);
+  const lite = rows.find(r => r.ticker === 'LITE' && r.warning);
   return `<div class="metrics">
     ${metric('Holdings', rows.length)}
     ${metric('Avg Quality', rows.length ? rows.reduce((s,r)=>s + (Number(r.fundamental_quality_score)||0), 0) / rows.length : null)}
     ${metric('Avg Momentum', rows.length ? rows.reduce((s,r)=>s + (Number(r.momentum_technical_score)||0), 0) / rows.length : null)}
     ${metric('Bubble Size', 'Weight %')}
   </div>
-  ${concentration ? `<div class="warning">${esc(concentration.warning)}</div>` : ''}
+  ${lite ? `<div class="warning">${esc(lite.warning)}</div>` : ''}
   <div id="convictionPlot" class="plot-wrap"></div>
   <h3 class="panel-title" style="margin-top:16px">Matrix Detail</h3>
   ${table(rows, [
@@ -2611,6 +3119,10 @@ function renderWealthView(data) {
   const marketContext = data.market_context || moduleData.market_context || {};
   const narrative = data.portfolio_narrative || {};
   const rebalance = data.rebalancing_intelligence || {};
+  const framework = data.framework_compliance || moduleData.framework_compliance || {};
+  const positionSizing = data.position_sizing || moduleData.position_sizing || {};
+  const stagedExit = data.staged_exit_framework || moduleData.staged_exit_framework || {};
+  const macroRegime = data.macro_regime || moduleData.macro_regime || {};
   const riskContrib = data.risk_contribution || {};
   const ladder = data.liquidity_ladder || {};
   const topRisks = (committee.priority_engine || []).slice(0, 3);
@@ -2619,10 +3131,28 @@ function renderWealthView(data) {
   const worstDrawdown = [...(drawdown.scenarios || [])].sort((a,b) => (Number(b.portfolio_loss_pct) || 0) - (Number(a.portfolio_loss_pct) || 0))[0] || {};
   const worstFactorStress = [...factorStressRows].sort((a,b) => (Number(b.estimated_portfolio_loss_pct) || 0) - (Number(a.estimated_portfolio_loss_pct) || 0))[0] || {};
   const benchmarkGoal = (goals.goals || []).find(g => g.goal_type === 'benchmark_relative') || (goals.goals || [])[0] || {};
+  const frameworkSummary = framework.summary || {};
+  const frameworkIssue = framework.dominant_issue || {};
+  const stagedActive = stagedExit.active_stage || {};
+  const sizingWarnings = (positionSizing.items || []).filter(r => r.warning).slice(0, 3);
   const contributors = (attribution.items || []).filter(r => Number(r.active_contribution_pct) > 0).slice(0, 3);
   const detractors = (attribution.items || []).filter(r => Number(r.active_contribution_pct) < 0).slice(0, 3);
   const efficiencyRows = capital.items || [];
   const lowEfficiency = efficiencyRows.filter(r => ['oversized risk budget','capital review needed'].includes(r.label)).slice(0, 3);
+  const riskByTicker = Object.fromEntries((riskContrib.items || []).map(r => [r.ticker, r]));
+  const strongestRiskAdjusted = [...efficiencyRows]
+    .filter(r => Number(r.capital_efficiency_score) > 0 && !['oversized risk budget','capital review needed'].includes(r.label))
+    .sort((a,b) => (Number(b.capital_efficiency_score) || 0) - (Number(a.capital_efficiency_score) || 0))
+    .slice(0, 3);
+  const valueWithoutRiskExcess = contributors.filter(r => {
+    const rr = riskByTicker[r.ticker] || {};
+    const risk = Number(rr.volatility_contribution_pct);
+    const weight = Number(rr.portfolio_weight_pct ?? r.weight_pct);
+    return !Number.isFinite(risk) || !Number.isFinite(weight) || risk <= weight + 5;
+  }).slice(0, 3);
+  const workingInterpretation = contributors.length
+    ? `Positive active contribution exists, but should be judged against risk budget and benchmark context rather than return alone.`
+    : `No positive attribution items are available from the latest scan.`;
   const metricText = v => (v === null || v === undefined || v === '' ? 'Metric unavailable' : String(v));
   const tableOrMessage = (rows, cols, message='No active items requiring review.') => (rows && rows.length) ? table(rows, cols) : `<div class="empty">${esc(message)}</div>`;
   const conclusionCard = (label, conclusion, support, reason, action) => `<article class="conclusion-card">
@@ -2669,7 +3199,10 @@ function renderWealthView(data) {
     'liquidity deterioration': 'Review liquidity capacity'
   };
   const actionLines = topActions.slice(0, 3).map((r, i) => `${i + 1}. ${actionLabelMap[String(r.category || '').toLowerCase()] || r.review_type || r.category || 'Review item'}`);
-  const cioSummary = `Portfolio is ${String(benchmarkMain).toLowerCase()}, but ${topRisk.category || 'concentration'}, ${dominantFactor.factor || 'factor crowding'}, and modeled stress losses remain the primary risks.`;
+  const benchmarkNeedsReview = String(benchmarkMain).toLowerCase().includes('needs review');
+  const cioSummary = benchmarkNeedsReview
+    ? 'Portfolio remains concentrated and requires review.'
+    : `Portfolio is ${String(benchmarkMain).toLowerCase()}, but ${topRisk.category || 'concentration'}, ${dominantFactor.factor || 'factor crowding'}, and modeled stress losses remain the primary risks.`;
   const detailStressTables = `
     ${tableOrMessage(drawdown.scenarios || [], [
       {key:'scenario', label:'Scenario'}, {key:'shock_pct', label:'Shock %'}, {key:'dollar_loss', label:'Dollar Loss'}, {key:'portfolio_loss_pct', label:'Portfolio Loss %'}, {key:'recovery_needed_pct', label:'Recovery Needed %'}
@@ -2748,6 +3281,20 @@ function renderWealthView(data) {
 	    )}
   </div>
 
+  <h3 class="panel-title" style="margin-top:16px">What is Working</h3>
+  <div class="metrics">
+    ${metric('Positive Contributors', contributors.length)}
+    ${metric('Risk-Adjusted Drivers', strongestRiskAdjusted.length)}
+    ${metric('Benchmark Context', benchmarkMain)}
+    ${metric('Within Risk Budget', valueWithoutRiskExcess.length)}
+  </div>
+  <div class="news-list">
+    <div class="news-item"><div class="news-meta">Top Positive Contributors</div><div class="news-title">${contributors.map(r => `${esc(r.ticker)}: ${esc(r.active_contribution_pct)}% active contribution`).join('<br>') || 'Positive contribution data unavailable.'}</div></div>
+    <div class="news-item"><div class="news-meta">Risk-Adjusted Contributors</div><div class="news-title">${strongestRiskAdjusted.map(r => `${esc(r.ticker)}: efficiency ${esc(r.capital_efficiency_score)} · ${esc(r.label || 'inside review range')}`).join('<br>') || 'Risk-adjusted contributor data unavailable.'}</div></div>
+    <div class="news-item"><div class="news-meta">Adding Value Without Excess Risk</div><div class="news-title">${valueWithoutRiskExcess.map(r => `${esc(r.ticker)}: positive active contribution with risk budget not materially above weight`).join('<br>') || 'No holdings clearly meet this filter in the latest scan.'}</div></div>
+    <div class="news-item"><div class="news-meta">CIO Interpretation</div><div class="news-title">${esc(workingInterpretation)}</div></div>
+  </div>
+
   <div class="metrics">
     ${metric('Net Portfolio Value', policy.total_value)}
     ${metric('Risk Grade', committeeCards.portfolio_risk_grade || liquidity.risk_grade || '--')}
@@ -2755,6 +3302,12 @@ function renderWealthView(data) {
     ${metric('Capital Efficiency', capital.average_efficiency_score)}
   </div>
   ${miniMarketStrip(marketContext.items || [])}
+  <div class="metrics">
+    ${metric('Macro Regime', macroRegime.current_regime || '--')}
+    ${metric('Macro Confidence', macroRegime.confidence_score, '%')}
+    ${metric('Macro Coverage', macroRegime.coverage_pct, '%')}
+  </div>
+  <div class="news-item"><div class="news-meta">Macro Decision Context</div><div class="news-title">${esc(macroRegime.interpretation || macroRegime.reason || 'Macro regime context unavailable.')}</div></div>
 
   <h3 class="panel-title" style="margin-top:16px">Weekly Portfolio Narrative</h3>
   <div class="news-list">
@@ -2762,7 +3315,7 @@ function renderWealthView(data) {
   </div>
 
   <h3 class="panel-title" style="margin-top:16px">Risk Requiring Attention</h3>
-  ${policy.concentration_warning ? `<div class="warning">${esc(policy.concentration_warning)}</div>` : ''}
+  ${policy.lite_warning ? `<div class="warning">${esc(policy.lite_warning)}</div>` : ''}
   <div class="metrics">
     ${metric('Top Holding', liquidity.top1_weight_pct, '%')}
     ${metric('Top 3 Holdings', liquidity.top3_weight_pct, '%')}
@@ -2807,6 +3360,18 @@ function renderWealthView(data) {
     ${metric('Excess vs SPY', benchmarkGoal.excess_return_vs_spy_pct, '%')}
     ${metric('Real Return', benchmarkGoal.real_return_after_inflation_pct, '%')}
     ${metric('Queue Items', (committee.decision_queue || []).length)}
+  </div>
+  <h3 class="panel-title" style="margin-top:16px">Strategy Frameworks</h3>
+  <div class="metrics">
+    ${metric('Rule Breaches', frameworkSummary.breach ?? 0)}
+    ${metric('Active Rules', frameworkSummary.active ?? 0)}
+    ${metric('Staged Exit', stagedActive.stage || '--')}
+    ${metric('Sizing Warnings', sizingWarnings.length)}
+  </div>
+  <div class="news-list">
+    <div class="news-item"><div class="news-meta">Framework Compliance</div><div class="news-title">${esc(frameworkIssue.rule_name || '--')} · ${esc(frameworkIssue.status || '--')} · ${esc(frameworkIssue.review_action || 'No active rule requiring review.')}</div></div>
+    <div class="news-item"><div class="news-meta">Staged Exit Framework</div><div class="news-title">${esc(stagedExit.target_ticker || '--')} · ${esc(stagedActive.stage || '--')} · ${esc(stagedActive.suggested_review_action || '--')}</div></div>
+    <div class="news-item"><div class="news-meta">Position Sizing</div><div class="news-title">${sizingWarnings.map(r => `${esc(r.ticker)}: ${esc(r.warning)}`).join('<br>') || 'No active sizing warnings from watchlist candidates.'}</div></div>
   </div>
   ${tableOrMessage((committee.decision_queue || []).slice(0, 6), [
     {key:'review_type', label:'Review'}, {key:'category', label:'Category'}, {key:'severity', label:'Severity'}, {key:'reason', label:'Reason'}
@@ -2988,10 +3553,10 @@ function renderBehavioral(data) {
     ${metric('Grade', data.overall_grade)}
     ${metric('Avg Bias', data.avg_score)}
     ${metric('HHI', data.portfolio_concentration_hhi)}
-    ${metric('Tax Context', 'Jurisdiction-specific')}
+    ${metric('Tax Context', 'F-1 NRA')}
   </div>
   <div class="news-item"><div class="news-meta">Devil's advocate</div><div class="news-title">${esc(data.devils_advocate || '')}</div></div>
-  ${data.concentration_warning ? `<div class="news-item"><div class="news-meta">Concentration flag</div><div class="news-title pos">${esc(data.concentration_warning)}</div></div>` : ''}
+  <div class="news-item"><div class="news-meta">LITE special flag</div><div class="news-title pos">${esc(data.lite_special_flag || '')}</div></div>
   ${table(scores, [{key:'bias', label:'Bias'}, {key:'score', label:'Score'}])}
   <h3 class="panel-title" style="margin-top:16px">Recommendations</h3>
   <div class="news-list">${(data.recommendations || []).map(x => `<div class="news-item"><div class="news-title">${esc(x)}</div></div>`).join('')}</div>`;

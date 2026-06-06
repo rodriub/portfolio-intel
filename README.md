@@ -37,7 +37,7 @@ The platform is designed to work with free or optional API tiers:
 - Polygon.io for primary official pricing when configured
 - yfinance for fallback prices, fundamentals, earnings, holders, and options metadata
 - FRED for macroeconomic series
-- NewsAPI for general delayed news context
+- NewsData for general delayed news context
 - Finnhub free endpoints where available
 - Tiingo where configured
 - SEC API and public EDGAR fallback for filings context
